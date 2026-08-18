@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>PackyAPI 用量排行榜</title>
+  <link rel="stylesheet" href="/packy-usage.css">
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/my"><span class="brand-mark" aria-hidden="true">P</span><span class="brand-name">Packy 用量中心</span><span class="brand-context">团队额度监控</span></a>
+    <nav class="main-nav" aria-label="主导航">
+      <a class="nav-link" href="/my"><i data-lucide="gauge" aria-hidden="true"></i>我的用量</a>
+      <a class="nav-link is-active" href="/leaderboard" aria-current="page"><i data-lucide="trophy" aria-hidden="true"></i>排行榜</a>
+    </nav>
+    <div class="header-actions">
+      <button class="button header-refresh" id="refreshButton" type="button" disabled><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button>
+      <button class="icon-button" id="themeButton" type="button" aria-label="切换主题"><i data-lucide="moon" aria-hidden="true"></i></button>
+    </div>
+  </header>
+  <main class="page">
+    <div class="page-heading">
+      <div><h1>账号消耗排行</h1><div class="subtitle" id="updatedLabel">正在读取排行数据</div></div>
+      <div class="countdown">下次更新 <strong id="countdown">02:00</strong></div>
+    </div>
+    <div class="error-banner" id="errorBanner" role="alert"><i data-lucide="circle-alert" aria-hidden="true"></i><span id="errorText"></span></div>
+    <section class="leaderboard-shell" aria-labelledby="leaderboardTitle">
+      <div class="leaderboard-header"><h2 class="leaderboard-title" id="leaderboardTitle"><i data-lucide="trophy" aria-hidden="true"></i>排行榜</h2><span class="cache-label">按已用金额从高到低</span></div>
+      <div class="loading-state" id="loadingState"><div class="state-stack"><i data-lucide="loader-circle" aria-hidden="true"></i><span>正在同步用量</span></div></div>
+      <div class="empty-state" id="emptyState" hidden><div class="state-stack"><i data-lucide="list-ordered" aria-hidden="true"></i><span>暂时没有账号参与排行</span></div></div>
+      <div class="table-wrap" id="tableWrap" hidden>
+        <table class="usage-table"><thead><tr><th class="rank-column">排名</th><th>账号</th><th class="amount-column">已用金额</th></tr></thead><tbody id="leaderboardBody"></tbody></table>
+      </div>
+    </section>
+  </main>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script>
+    (() => {
+      const state = { accounts:[], refreshSeconds:120, nextRefreshAt:Date.now() + 120000, loading:false };
+      const $ = (id) => document.getElementById(id);
+      const elements = { refreshButton:$("refreshButton"), themeButton:$("themeButton"), updatedLabel:$("updatedLabel"), countdown:$("countdown"), errorBanner:$("errorBanner"), errorText:$("errorText"), loadingState:$("loadingState"), emptyState:$("emptyState"), tableWrap:$("tableWrap"), leaderboardBody:$("leaderboardBody") };
+      const money = new Intl.NumberFormat("en-US", { style:"currency", currency:"USD", minimumFractionDigits:2, maximumFractionDigits:2 });
+      function icons() { if (window.lucide) window.lucide.createIcons({ attrs:{ "stroke-width":1.8 } }); }
+      function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[char]); }
+      function formatDuration(seconds) { const safe = Math.max(0, Math.ceil(seconds)); return `${String(Math.floor(safe / 60)).padStart(2,"0")}:${String(safe % 60).padStart(2,"0")}`; }
+      function showError(message) { elements.errorText.textContent = message; elements.errorBanner.classList.add("is-visible"); }
+      function clearError() { elements.errorText.textContent = ""; elements.errorBanner.classList.remove("is-visible"); }
+      function render() {
+        elements.loadingState.hidden = true;
+        const hasAccounts = state.accounts.length > 0;
+        elements.emptyState.hidden = hasAccounts; elements.tableWrap.hidden = !hasAccounts;
+        elements.leaderboardBody.innerHTML = state.accounts.map((account,index) => `<tr data-rank="${index + 1}"><td class="rank-column"><span class="rank-number">${index + 1}</span></td><td><div class="leader-name">${escapeHtml(account.name)}</div></td><td class="amount-column"><span class="amount">${account.used === null ? "暂不可用" : money.format(Number(account.used))}</span></td></tr>`).join("");
+      }
+      async function loadLeaderboard() {
+        if (state.loading) return;
+        state.loading = true; elements.refreshButton.disabled = true; clearError();
+        try {
+          const response = await fetch("/api/leaderboard", { cache:"no-store" }); const payload = await response.json();
+          if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
+          state.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+          state.refreshSeconds = Math.max(120, Number(payload.refreshIntervalSeconds || 120));
+          state.nextRefreshAt = Number(payload.nextRefreshAt || 0) * 1000 || Date.now() + state.refreshSeconds * 1000;
+          elements.updatedLabel.textContent = `数据更新于 ${new Date(Number(payload.generatedAt) * 1000).toLocaleString("zh-CN", { hour12:false })}`;
+          render();
+        } catch (error) { showError(error.message || "无法读取排行榜"); elements.updatedLabel.textContent = state.accounts.length ? elements.updatedLabel.textContent : "读取失败"; state.nextRefreshAt = Date.now() + state.refreshSeconds * 1000; }
+        finally { state.loading = false; updateCountdown(); }
+      }
+      function updateCountdown() { const remaining = (state.nextRefreshAt - Date.now()) / 1000; elements.countdown.textContent = formatDuration(remaining); const ready = remaining <= 0 && !state.loading; elements.refreshButton.disabled = !ready; if (ready) loadLeaderboard(); }
+      function applyTheme(theme) { document.documentElement.dataset.theme = theme; elements.themeButton.innerHTML = `<i data-lucide="${theme === "dark" ? "sun" : "moon"}" aria-hidden="true"></i>`; icons(); }
+      function initTheme() { const saved = localStorage.getItem("packy-theme"); applyTheme(saved || (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light")); }
+      elements.refreshButton.addEventListener("click", loadLeaderboard);
+      elements.themeButton.addEventListener("click", () => { const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; localStorage.setItem("packy-theme", next); applyTheme(next); });
+      initTheme(); icons(); loadLeaderboard(); window.setInterval(updateCountdown,1000);
+    })();
+  </script>
+</body>
+</html>

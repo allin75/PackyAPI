@@ -1,0 +1,27 @@
+services:
+  packy-usage:
+    build: .
+    container_name: packy-usage
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8765
+      DATA_DIR: /data
+      REFRESH_INTERVAL_SECONDS: 120
+      PACKY_MASTER_KEY_FILE: /run/secrets/packy_master_key
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data:/data
+    secrets:
+      - packy_master_key
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+
+secrets:
+  packy_master_key:
+    file: ./secrets/master.key

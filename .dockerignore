@@ -1,0 +1,10 @@
+data
+secrets
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+packy-accounts.json
+packy-accounts.example.json
+packy-usage-server.ps1
+packy-usage-server.test.mjs
+start-packy-usage.cmd

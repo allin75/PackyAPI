@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>我的 PackyAPI 用量</title>
+  <link rel="stylesheet" href="/packy-usage.css">
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="/my"><span class="brand-mark" aria-hidden="true">P</span><span class="brand-name">Packy 用量中心</span><span class="brand-context">团队额度监控</span></a>
+    <nav class="main-nav" aria-label="主导航">
+      <a class="nav-link is-active" href="/my" aria-current="page"><i data-lucide="gauge" aria-hidden="true"></i>我的用量</a>
+      <a class="nav-link" href="/leaderboard"><i data-lucide="trophy" aria-hidden="true"></i>排行榜</a>
+    </nav>
+    <div class="header-actions">
+      <button class="button header-refresh" id="refreshButton" type="button" disabled><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button>
+      <button class="icon-button" id="themeButton" type="button" aria-label="切换主题"><i data-lucide="moon" aria-hidden="true"></i></button>
+    </div>
+  </header>
+  <main class="page">
+    <div class="page-heading">
+      <div><h1>我的用量</h1><div class="subtitle" id="updatedLabel">正在读取当前 IP 的账号</div></div>
+      <div class="countdown">下次更新 <strong id="countdown">02:00</strong></div>
+    </div>
+    <div class="error-banner" id="errorBanner" role="alert"><i data-lucide="circle-alert" aria-hidden="true"></i><span id="errorText"></span></div>
+    <div class="success-banner" id="successBanner" role="status"><i data-lucide="circle-check" aria-hidden="true"></i><span id="successText"></span></div>
+
+    <section class="enroll-panel" aria-labelledby="enrollTitle">
+      <div class="enroll-copy"><h2 id="enrollTitle">绑定 PackyAPI Key</h2></div>
+      <form class="key-form" id="keyForm">
+        <label class="field"><span class="field-label">API Key</span><span class="input-wrap">
+          <input class="text-input" id="keyInput" name="key" type="password" placeholder="sk-..." autocomplete="off" spellcheck="false" required>
+          <button class="icon-button input-action" id="revealButton" type="button" aria-label="显示 Key"><i data-lucide="eye" aria-hidden="true"></i></button>
+        </span></label>
+        <button class="button button-primary" id="registerButton" type="submit"><i data-lucide="plus" aria-hidden="true"></i><span>绑定账号</span></button>
+      </form>
+    </section>
+
+    <section aria-labelledby="accountListTitle">
+      <div class="section-heading"><h2 id="accountListTitle">已绑定账号</h2><span class="account-count" id="accountCount">等待数据</span></div>
+      <div class="loading-state" id="loadingState"><div class="state-stack"><i data-lucide="loader-circle" aria-hidden="true"></i><span>正在同步账号用量</span></div></div>
+      <div class="empty-state" id="emptyState" hidden><div class="state-stack"><i data-lucide="key-round" aria-hidden="true"></i><span>当前 IP 还没有绑定账号</span></div></div>
+      <div class="account-list" id="accountList" hidden></div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script>
+    (() => {
+      const state = { accounts: [], refreshSeconds: 120, nextRefreshAt: Date.now() + 120000, loading: false };
+      const $ = (id) => document.getElementById(id);
+      const elements = {
+        refreshButton: $("refreshButton"), themeButton: $("themeButton"), updatedLabel: $("updatedLabel"), countdown: $("countdown"),
+        errorBanner: $("errorBanner"), errorText: $("errorText"), successBanner: $("successBanner"), successText: $("successText"),
+        keyForm: $("keyForm"), keyInput: $("keyInput"), revealButton: $("revealButton"), registerButton: $("registerButton"),
+        loadingState: $("loadingState"), emptyState: $("emptyState"), accountList: $("accountList"), accountCount: $("accountCount")
+      };
+      const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const decimal = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      function icons() { if (window.lucide) window.lucide.createIcons({ attrs: { "stroke-width": 1.8 } }); }
+      function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[char]); }
+      function formatDuration(seconds) { const safe = Math.max(0, Math.ceil(seconds)); return `${String(Math.floor(safe / 60)).padStart(2,"0")}:${String(safe % 60).padStart(2,"0")}`; }
+      function showError(message) { elements.errorText.textContent = message; elements.errorBanner.classList.add("is-visible"); }
+      function clearError() { elements.errorText.textContent = ""; elements.errorBanner.classList.remove("is-visible"); }
+      function showSuccess(message) { elements.successText.textContent = message; elements.successBanner.classList.add("is-visible"); window.setTimeout(() => elements.successBanner.classList.remove("is-visible"), 5000); }
+      async function requestJson(url, options = {}) { const response = await fetch(url, { cache:"no-store", ...options }); const payload = await response.json(); if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`); return payload; }
+      function accountStatus(account) {
+        if (account.status === "error") return { label:"查询失败", className:"is-error" };
+        if (account.stale) return { label:"缓存数据", className:"is-stale" };
+        return { label:"数据正常", className:"" };
+      }
+      function renderAccounts() {
+        elements.loadingState.hidden = true;
+        const hasAccounts = state.accounts.length > 0;
+        elements.emptyState.hidden = hasAccounts;
+        elements.accountList.hidden = !hasAccounts;
+        elements.accountCount.textContent = `${state.accounts.length} 个账号`;
+        elements.accountList.innerHTML = state.accounts.map((account) => {
+          const available = account.status !== "error" && account.used !== null;
+          const rate = available ? Number(account.usageRate || 0) : 0;
+          const summary = available ? `[${account.name}] 已使用：${decimal.format(rate)}% / 剩余：${decimal.format(Number(account.remaining || 0))} USD / ${account.resetLabel || "不重置"}` : `[${account.name}] 当前用量暂不可用`;
+          const status = accountStatus(account);
+          return `<article class="account-card" data-account-id="${escapeHtml(account.id)}">
+            <div class="account-top"><div class="account-title"><h3>${escapeHtml(account.name)}</h3><div class="exact-summary"><strong>${escapeHtml(summary)}</strong></div><span class="account-state ${status.className}">${status.label}</span></div></div>
+            <div class="account-metrics">
+              <div class="metric"><div class="metric-label">已用金额</div><div class="metric-value">${available ? money.format(Number(account.used)) : "—"}</div></div>
+              <div class="metric"><div class="metric-label">剩余额度</div><div class="metric-value">${available ? money.format(Number(account.remaining)) : "—"}</div></div>
+              <div class="metric"><div class="metric-label">总额度</div><div class="metric-value">${available ? money.format(Number(account.total)) : "—"}</div></div>
+            </div>
+            <div class="usage-progress" role="progressbar" aria-label="${escapeHtml(account.name)} 使用率" aria-valuenow="${rate}" aria-valuemin="0" aria-valuemax="100"><div class="usage-progress-bar" style="width:${Math.min(100,Math.max(0,rate))}%"></div></div>
+            <div class="account-actions">
+              <label class="switch-control"><input class="leaderboard-toggle" type="checkbox" data-account-id="${escapeHtml(account.id)}" ${account.leaderboardEnabled ? "checked" : ""}><span class="switch-track" aria-hidden="true"></span><span>加入排行榜</span></label>
+              <button class="button button-danger unbind-button" type="button" data-account-id="${escapeHtml(account.id)}" data-account-name="${escapeHtml(account.name)}"><i data-lucide="unlink" aria-hidden="true"></i><span>解绑当前 IP</span></button>
+            </div>
+          </article>`;
+        }).join("");
+        elements.accountList.querySelectorAll(".leaderboard-toggle").forEach((input) => input.addEventListener("change", toggleLeaderboard));
+        elements.accountList.querySelectorAll(".unbind-button").forEach((button) => button.addEventListener("click", unbindAccount));
+        icons();
+      }
+      async function loadAccounts() {
+        if (state.loading) return;
+        state.loading = true; elements.refreshButton.disabled = true; clearError();
+        try {
+          const payload = await requestJson("/api/me");
+          state.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+          state.refreshSeconds = Math.max(120, Number(payload.refreshIntervalSeconds || 120));
+          state.nextRefreshAt = Number(payload.nextRefreshAt || 0) * 1000 || Date.now() + state.refreshSeconds * 1000;
+          elements.updatedLabel.textContent = `数据更新于 ${new Date(Number(payload.generatedAt) * 1000).toLocaleString("zh-CN", { hour12:false })}`;
+          renderAccounts();
+        } catch (error) {
+          showError(error.message || "无法读取账号用量"); elements.updatedLabel.textContent = state.accounts.length ? elements.updatedLabel.textContent : "读取失败"; state.nextRefreshAt = Date.now() + state.refreshSeconds * 1000;
+        } finally { state.loading = false; updateCountdown(); }
+      }
+      async function toggleLeaderboard(event) {
+        const input = event.currentTarget; const accountId = input.dataset.accountId; input.disabled = true; clearError();
+        try {
+          await requestJson(`/api/me/accounts/${encodeURIComponent(accountId)}/leaderboard`, { method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ enabled:input.checked }) });
+          const account = state.accounts.find((item) => item.id === accountId); if (account) account.leaderboardEnabled = input.checked;
+          showSuccess(input.checked ? "已加入排行榜。" : "已退出排行榜。");
+        } catch (error) { input.checked = !input.checked; showError(error.message || "无法修改排行榜状态"); } finally { input.disabled = false; }
+      }
+      async function unbindAccount(event) {
+        const button = event.currentTarget; const accountId = button.dataset.accountId; const accountName = button.dataset.accountName;
+        if (!window.confirm(`确认解绑当前 IP 对“${accountName}”的访问？`)) return;
+        button.disabled = true; clearError();
+        try {
+          const result = await requestJson(`/api/me/accounts/${encodeURIComponent(accountId)}/ip`, { method:"DELETE" });
+          showSuccess(result.deletedAccount ? "已解绑，并删除最后一个无人绑定的账号。" : "已解绑当前 IP。账号仍由其他 IP 使用。"); await loadAccounts();
+        } catch (error) { showError(error.message || "无法解绑当前 IP"); button.disabled = false; }
+      }
+      async function registerAccount(event) {
+        event.preventDefault(); const key = elements.keyInput.value.trim(); if (!key) return;
+        elements.registerButton.disabled = true; elements.keyInput.disabled = true; clearError();
+        try {
+          const result = await requestJson("/api/accounts/register", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ key }) });
+          elements.keyInput.value = ""; showSuccess(`已绑定 ${result.account.name}。`); await loadAccounts();
+        } catch (error) { showError(error.message || "无法绑定账号"); }
+        finally { elements.keyInput.disabled = false; elements.registerButton.disabled = false; elements.keyInput.focus(); }
+      }
+      function updateCountdown() { const remaining = (state.nextRefreshAt - Date.now()) / 1000; elements.countdown.textContent = formatDuration(remaining); const ready = remaining <= 0 && !state.loading; elements.refreshButton.disabled = !ready; if (ready) loadAccounts(); }
+      function applyTheme(theme) { document.documentElement.dataset.theme = theme; elements.themeButton.innerHTML = `<i data-lucide="${theme === "dark" ? "sun" : "moon"}" aria-hidden="true"></i>`; icons(); }
+      function initTheme() { const saved = localStorage.getItem("packy-theme"); applyTheme(saved || (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light")); }
+      elements.keyForm.addEventListener("submit", registerAccount);
+      elements.revealButton.addEventListener("click", () => { const revealing = elements.keyInput.type === "password"; elements.keyInput.type = revealing ? "text" : "password"; elements.revealButton.setAttribute("aria-label", revealing ? "隐藏 Key" : "显示 Key"); elements.revealButton.innerHTML = `<i data-lucide="${revealing ? "eye-off" : "eye"}" aria-hidden="true"></i>`; icons(); });
+      elements.refreshButton.addEventListener("click", loadAccounts);
+      elements.themeButton.addEventListener("click", () => { const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; localStorage.setItem("packy-theme", next); applyTheme(next); });
+      initTheme(); icons(); loadAccounts(); window.setInterval(updateCountdown, 1000);
+    })();
+  </script>
+</body>
+</html>

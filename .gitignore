@@ -1,0 +1,18 @@
+# Runtime secrets and data
+data/
+secrets/
+.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.key
+
+# Legacy local-only files
+packy-accounts.json
+packy-accounts.example.json
+packy-usage-server.ps1
+
+# Local output
+*.log
+.DS_Store
+Thumbs.db
