@@ -10,7 +10,7 @@ services:
       HOST: 0.0.0.0
       PORT: 8765
       DATA_DIR: /data
-      REFRESH_INTERVAL_SECONDS: 120
+      REFRESH_INTERVAL_SECONDS: 300
       PACKY_MASTER_KEY_FILE: /run/secrets/packy_master_key
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
     ports:
@@ -21,6 +21,19 @@ services:
       - packy_master_key
     tmpfs:
       - /tmp:size=16m,noexec,nosuid
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: packyapi-cloudflared
+    restart: unless-stopped
+    user: "1000:1001"
+    network_mode: host
+    command: tunnel --no-autoupdate run --token-file /run/secrets/cloudflare_tunnel_token
+    volumes:
+      - ./secrets/cloudflare-tunnel.token:/run/secrets/cloudflare_tunnel_token:ro
+    depends_on:
+      packy-usage:
+        condition: service_healthy
 
 secrets:
   packy_master_key:

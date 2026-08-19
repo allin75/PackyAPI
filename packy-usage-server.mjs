@@ -12,6 +12,9 @@ const DEFAULT_ORIGIN = 'https://www.packyapi.ai';
 const ALLOWED_PACKY_HOSTS = new Set(['www.packyapi.ai', 'www.packyapi.com', 'slb-v1.api.fan']);
 const KEY_PATTERN = /^sk-[A-Za-z0-9_-]{20,}$/;
 const JSON_BODY_LIMIT = 8 * 1024;
+const SESSION_COOKIE_NAME = '__Host-packy_session';
+const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const DEFAULT_REFRESH_SECONDS = 5 * 60;
 
 class PublicError extends Error {
   constructor(statusCode, message, headers = {}) {
@@ -71,6 +74,21 @@ function firstHeaderValue(value) {
   return value ? String(value) : '';
 }
 
+function readCookie(request, name) {
+  const header = firstHeaderValue(request.headers?.cookie);
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 0) continue;
+    const key = part.slice(0, separator).trim();
+    if (key === name) return part.slice(separator + 1).trim();
+  }
+  return '';
+}
+
+function createSessionCookie(token, maxAge) {
+  return `${SESSION_COOKIE_NAME}=${token}; Path=/; Max-Age=${Math.max(0, Math.floor(maxAge))}; HttpOnly; Secure; SameSite=Strict`;
+}
+
 export function resolveRequestIdentity(request, isTrustedProxy = () => false) {
   const peerIp = normalizeIp(request.socket?.remoteAddress);
   const peerIsTrusted = isTrustedProxy(peerIp);
@@ -121,7 +139,8 @@ export function loadMasterKey({ dataDir, env = process.env } = {}) {
 function deriveKeys(masterKey) {
   return {
     encryption: Buffer.from(hkdfSync('sha256', masterKey, Buffer.alloc(0), 'packy-key-encryption-v1', 32)),
-    fingerprint: Buffer.from(hkdfSync('sha256', masterKey, Buffer.alloc(0), 'packy-key-fingerprint-v1', 32))
+    fingerprint: Buffer.from(hkdfSync('sha256', masterKey, Buffer.alloc(0), 'packy-key-fingerprint-v1', 32)),
+    session: Buffer.from(hkdfSync('sha256', masterKey, Buffer.alloc(0), 'packy-session-v1', 32))
   };
 }
 
@@ -135,31 +154,84 @@ export class AccountStore {
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
       PRAGMA busy_timeout = 5000;
-      CREATE TABLE IF NOT EXISTS accounts (
-        id TEXT PRIMARY KEY,
-        key_fingerprint TEXT NOT NULL UNIQUE,
-        key_ciphertext TEXT NOT NULL,
-        key_iv TEXT NOT NULL,
-        key_tag TEXT NOT NULL,
-        name TEXT NOT NULL,
-        origin TEXT NOT NULL,
-        leaderboard_enabled INTEGER NOT NULL DEFAULT 0 CHECK (leaderboard_enabled IN (0, 1)),
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS account_ips (
-        account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-        ip TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        PRIMARY KEY (account_id, ip)
-      );
-      CREATE INDEX IF NOT EXISTS account_ips_ip_idx ON account_ips(ip);
-      PRAGMA user_version = 1;
     `);
+    const schemaVersion = Number(this.db.prepare('PRAGMA user_version').get().user_version || 0);
+    if (schemaVersion > 3) throw new Error(`Database schema version ${schemaVersion} is newer than this application supports.`);
+    if (schemaVersion < 1) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS accounts (
+          id TEXT PRIMARY KEY,
+          key_fingerprint TEXT NOT NULL UNIQUE,
+          key_ciphertext TEXT NOT NULL,
+          key_iv TEXT NOT NULL,
+          key_tag TEXT NOT NULL,
+          name TEXT NOT NULL,
+          origin TEXT NOT NULL,
+          leaderboard_enabled INTEGER NOT NULL DEFAULT 0 CHECK (leaderboard_enabled IN (0, 1)),
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS account_ips (
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          ip TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (account_id, ip)
+        );
+        CREATE INDEX IF NOT EXISTS account_ips_ip_idx ON account_ips(ip);
+        PRAGMA user_version = 1;
+      `);
+    }
+    if (schemaVersion < 2) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
+          account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          used REAL,
+          rank INTEGER NOT NULL,
+          rank_delta INTEGER,
+          observed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS leaderboard_snapshots_rank_idx ON leaderboard_snapshots(rank);
+        CREATE TABLE IF NOT EXISTS leaderboard_snapshot_meta (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          generated_at INTEGER NOT NULL,
+          next_refresh_at INTEGER NOT NULL
+        );
+        PRAGMA user_version = 2;
+        COMMIT;
+      `);
+    }
+    if (schemaVersion < 3) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY,
+          token_hash TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL,
+          last_seen_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
+        CREATE TABLE IF NOT EXISTS session_accounts (
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          created_at INTEGER NOT NULL,
+          PRIMARY KEY (session_id, account_id)
+        );
+        CREATE INDEX IF NOT EXISTS session_accounts_account_idx ON session_accounts(account_id);
+        PRAGMA user_version = 3;
+        COMMIT;
+      `);
+    }
   }
 
   fingerprint(key) {
     return createHmac('sha256', this.keys.fingerprint).update(key, 'utf8').digest('hex');
+  }
+
+  hashSessionToken(token) {
+    return createHmac('sha256', this.keys.session).update(token, 'utf8').digest('hex');
   }
 
   encryptKey(key) {
@@ -199,12 +271,96 @@ export class AccountStore {
     `).all(ip);
   }
 
+  listBySession(sessionId) {
+    return this.db.prepare(`
+      SELECT a.* FROM accounts a
+      INNER JOIN session_accounts sa ON sa.account_id = a.id
+      WHERE sa.session_id = ?
+      ORDER BY a.name COLLATE NOCASE, a.id
+    `).all(sessionId);
+  }
+
+  createSession(now, ttlSeconds) {
+    const id = randomUUID();
+    const token = randomBytes(32).toString('base64url');
+    const tokenHash = this.hashSessionToken(token);
+    this.db.prepare(`
+      INSERT INTO sessions (id, token_hash, created_at, last_seen_at, expires_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(id, tokenHash, now, now, now + ttlSeconds);
+    return { id, token, expiresAt: now + ttlSeconds };
+  }
+
+  findSession(token, now) {
+    if (!token) return null;
+    const session = this.db.prepare(`
+      SELECT id, created_at, last_seen_at, expires_at
+      FROM sessions
+      WHERE token_hash = ? AND expires_at > ?
+    `).get(this.hashSessionToken(token), now) || null;
+    if (!session) return null;
+    this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').run(now, session.id);
+    return { ...session, token };
+  }
+
+  bindSession(sessionId, accountId, now) {
+    this.db.prepare('INSERT OR IGNORE INTO session_accounts (session_id, account_id, created_at) VALUES (?, ?, ?)').run(sessionId, accountId, now);
+    this.db.prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?').run(now, sessionId);
+  }
+
+  hasSessionAccount(sessionId, accountId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM session_accounts WHERE session_id = ? AND account_id = ?').get(sessionId, accountId));
+  }
+
+  unbindSession(sessionId, accountId) {
+    const removed = this.db.prepare('DELETE FROM session_accounts WHERE session_id = ? AND account_id = ?').run(sessionId, accountId).changes > 0;
+    const remaining = Number(this.db.prepare('SELECT COUNT(*) AS count FROM session_accounts WHERE session_id = ?').get(sessionId)?.count || 0);
+    return { removed, remaining, deletedAccount: false };
+  }
+
   listLeaderboard() {
     return this.db.prepare(`
       SELECT * FROM accounts
       WHERE leaderboard_enabled = 1
       ORDER BY name COLLATE NOCASE, id
     `).all();
+  }
+
+  readLeaderboardSnapshot() {
+    const meta = this.db.prepare('SELECT generated_at, next_refresh_at FROM leaderboard_snapshot_meta WHERE id = 1').get() || null;
+    const rows = meta ? this.db.prepare(`
+      SELECT account_id, name, used, rank, rank_delta, observed_at
+      FROM leaderboard_snapshots
+      ORDER BY rank
+    `).all() : [];
+    return { meta, rows };
+  }
+
+  saveLeaderboardSnapshot(entries, generatedAt, nextRefreshAt) {
+    const insert = this.db.prepare(`
+      INSERT INTO leaderboard_snapshots (account_id, name, used, rank, rank_delta, observed_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.exec('DELETE FROM leaderboard_snapshots');
+      for (const entry of entries) {
+        insert.run(entry.accountId, entry.name, entry.used, entry.rank, entry.rankChange, generatedAt);
+      }
+      this.db.prepare(`
+        INSERT INTO leaderboard_snapshot_meta (id, generated_at, next_refresh_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET generated_at = excluded.generated_at, next_refresh_at = excluded.next_refresh_at
+      `).run(generatedAt, nextRefreshAt);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  invalidateLeaderboardSnapshot(now) {
+    this.db.prepare('UPDATE leaderboard_snapshot_meta SET next_refresh_at = ? WHERE id = 1').run(now);
   }
 
   createAccount({ key, name, origin, ip, now }) {
@@ -267,7 +423,8 @@ export class AccountStore {
     return {
       accounts: Number(this.db.prepare('SELECT COUNT(*) AS count FROM accounts').get().count),
       bindings: Number(this.db.prepare('SELECT COUNT(*) AS count FROM account_ips').get().count),
-      leaderboard: Number(this.db.prepare('SELECT COUNT(*) AS count FROM accounts WHERE leaderboard_enabled = 1').get().count)
+      leaderboard: Number(this.db.prepare('SELECT COUNT(*) AS count FROM accounts WHERE leaderboard_enabled = 1').get().count),
+      sessions: Number(this.db.prepare('SELECT COUNT(*) AS count FROM sessions').get().count)
     };
   }
 
@@ -451,14 +608,20 @@ function createFailureLimiter({ maxFailures = 5, windowMs = 15 * 60_000, nowMs =
 export function createPackyApp({
   databasePath,
   masterKey,
-  refreshSeconds = 120,
+  refreshSeconds = DEFAULT_REFRESH_SECONDS,
   trustedProxyCidrs = [],
   packyOrigin = DEFAULT_ORIGIN,
   usageProvider,
+  leaderboardRequestSpacingMs = 1_000,
+  leaderboardRetrySeconds = 600,
+  sessionTtlSeconds = DEFAULT_SESSION_TTL_SECONDS,
   nowMs = () => Date.now(),
   staticFiles
 }) {
-  const effectiveRefreshSeconds = Math.max(120, Number(refreshSeconds) || 120);
+  const effectiveRefreshSeconds = Math.max(DEFAULT_REFRESH_SECONDS, Number(refreshSeconds) || DEFAULT_REFRESH_SECONDS);
+  const effectiveLeaderboardSpacingMs = Math.max(0, Number(leaderboardRequestSpacingMs) || 0);
+  const effectiveLeaderboardRetrySeconds = Math.max(effectiveRefreshSeconds, Number(leaderboardRetrySeconds) || 600);
+  const effectiveSessionTtlSeconds = Math.max(effectiveRefreshSeconds, Number(sessionTtlSeconds) || DEFAULT_SESSION_TTL_SECONDS);
   const origin = usageProvider ? packyOrigin : validatePackyOrigin(packyOrigin);
   const queryUsage = usageProvider || ((key) => queryPackyUsage(key, origin));
   const store = new AccountStore(databasePath, masterKey);
@@ -466,6 +629,8 @@ export function createPackyApp({
   const limiter = createFailureLimiter({ nowMs });
   const cache = new Map();
   const inFlight = new Map();
+  let leaderboardInFlight = null;
+  let leaderboardRetry = null;
   const assets = staticFiles || {
     my: readStaticFile('packy-my-usage.html'),
     leaderboard: readStaticFile('packy-key-usage.html'),
@@ -498,7 +663,7 @@ export function createPackyApp({
         return primeUsage(account, data, now);
       } catch {
         const attemptedAt = Math.floor(now / 1000);
-        const stale = current?.result?.status !== 'error'
+        const stale = current?.result && current.result.status !== 'error'
           ? { ...current.result, status: 'stale', stale: true, nextRefreshAt: attemptedAt + effectiveRefreshSeconds }
           : makeUnavailableUsage(account, attemptedAt, effectiveRefreshSeconds);
         cache.set(account.id, { result: stale, lastAttemptMs: now });
@@ -511,8 +676,18 @@ export function createPackyApp({
     return pending;
   }
 
-  async function getPrivatePayload(ip) {
-    const accounts = store.listByIp(ip);
+  function getSession(request, now = Math.floor(nowMs() / 1000)) {
+    const token = readCookie(request, SESSION_COOKIE_NAME);
+    return store.findSession(token, now);
+  }
+
+  function requireSession(session) {
+    if (!session) throw new PublicError(401, '请先输入 Key 建立会话。');
+    return session;
+  }
+
+  async function getPrivatePayload(session) {
+    const accounts = store.listBySession(session.id);
     const usage = await Promise.all(accounts.map(async (account) => toPrivateAccount(await getAccountUsage(account), account)));
     const now = Math.floor(nowMs() / 1000);
     return {
@@ -523,27 +698,115 @@ export function createPackyApp({
     };
   }
 
-  async function getLeaderboardPayload() {
+  function publicLeaderboardPayload(snapshot, overrides = {}) {
+    return {
+      generatedAt: Number(snapshot.meta.generated_at),
+      refreshIntervalSeconds: effectiveRefreshSeconds,
+      nextRefreshAt: Number(snapshot.meta.next_refresh_at),
+      accounts: snapshot.rows.map((entry) => {
+        const rankChange = entry.rank_delta === null ? null : Number(entry.rank_delta);
+        return {
+          name: String(entry.name),
+          used: Number.isFinite(entry.used) ? Number(entry.used) : null,
+          rank: Number(entry.rank),
+          rankChange,
+          movement: rankChange === null ? 'new' : (rankChange > 0 ? 'up' : (rankChange < 0 ? 'down' : 'same'))
+        };
+      }),
+      ...overrides
+    };
+  }
+
+  function mergePendingLeaderboardAccounts(snapshot, accounts, observedAt) {
+    const activeAccountIds = new Set(accounts.map((account) => String(account.id)));
+    const rows = snapshot.rows.filter((entry) => activeAccountIds.has(String(entry.account_id)));
+    const snapshotAccountIds = new Set(rows.map((entry) => String(entry.account_id)));
+    let nextRank = rows.reduce((maximum, entry) => Math.max(maximum, Number(entry.rank)), 0) + 1;
+    for (const account of accounts) {
+      if (snapshotAccountIds.has(String(account.id))) continue;
+      rows.push({
+        account_id: String(account.id),
+        name: String(account.name),
+        used: null,
+        rank: nextRank,
+        rank_delta: null,
+        observed_at: observedAt
+      });
+      nextRank += 1;
+    }
+    return { meta: snapshot.meta, rows };
+  }
+
+  async function refreshLeaderboardSnapshot(previous, now) {
     const accounts = store.listLeaderboard();
-    const usage = await Promise.all(accounts.map(async (account) => await getAccountUsage(account)));
+    const usage = [];
+    for (let index = 0; index < accounts.length; index += 1) {
+      if (index > 0 && effectiveLeaderboardSpacingMs > 0) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, effectiveLeaderboardSpacingMs));
+      }
+      const account = accounts[index];
+      const item = await getAccountUsage(account);
+      usage.push({ account, usage: item });
+      if (previous.meta && item.status !== 'ok') break;
+    }
+    if (previous.meta && usage.some((item) => item.usage.status !== 'ok')) {
+      const retryAt = now + effectiveLeaderboardRetrySeconds;
+      const fallback = mergePendingLeaderboardAccounts(previous, accounts, now);
+      const payload = publicLeaderboardPayload(fallback, {
+        nextRefreshAt: retryAt,
+        stale: true,
+        message: '上游限流，已保留上次有效数据并延迟重试。'
+      });
+      leaderboardRetry = { untilMs: retryAt * 1000, payload };
+      return payload;
+    }
+
+    const previousRanks = new Map(previous.rows.map((entry) => [String(entry.account_id), Number(entry.rank)]));
     const entries = usage
-      .map((item) => ({ name: item.name, used: Number.isFinite(item.used) ? item.used : null }))
+      .map(({ account, usage: item }) => ({
+        accountId: String(account.id),
+        name: item.name,
+        used: Number.isFinite(item.used) ? item.used : null
+      }))
       .sort((left, right) => {
         if (left.used === null && right.used !== null) return 1;
         if (right.used === null && left.used !== null) return -1;
-        return (right.used || 0) - (left.used || 0) || left.name.localeCompare(right.name, 'zh-CN');
+        return (right.used || 0) - (left.used || 0)
+          || left.name.localeCompare(right.name, 'zh-CN')
+          || left.accountId.localeCompare(right.accountId);
+      })
+      .map((entry, index) => {
+        const rank = index + 1;
+        const previousRank = previousRanks.get(entry.accountId);
+        return { ...entry, rank, rankChange: previousRank === undefined ? null : previousRank - rank };
       });
-    const now = Math.floor(nowMs() / 1000);
-    return {
-      generatedAt: now,
-      refreshIntervalSeconds: effectiveRefreshSeconds,
-      nextRefreshAt: now + effectiveRefreshSeconds,
-      accounts: entries
-    };
+    const nextRefreshAt = now + effectiveRefreshSeconds;
+    store.saveLeaderboardSnapshot(entries, now, nextRefreshAt);
+    leaderboardRetry = null;
+    return publicLeaderboardPayload(store.readLeaderboardSnapshot());
+  }
+
+  async function getLeaderboardPayload() {
+    const nowMilliseconds = nowMs();
+    if (leaderboardRetry && nowMilliseconds < leaderboardRetry.untilMs) return leaderboardRetry.payload;
+    const now = Math.floor(nowMilliseconds / 1000);
+    const snapshot = store.readLeaderboardSnapshot();
+    if (snapshot.meta && Number(snapshot.meta.next_refresh_at) > now) return publicLeaderboardPayload(snapshot);
+    if (leaderboardInFlight) return leaderboardInFlight;
+    leaderboardInFlight = refreshLeaderboardSnapshot(snapshot, now).finally(() => {
+      leaderboardInFlight = null;
+    });
+    return leaderboardInFlight;
+  }
+
+  function invalidateLeaderboard(now) {
+    store.invalidateLeaderboardSnapshot(now);
+    leaderboardRetry = null;
   }
 
   async function handler(request, response) {
     const identity = resolveRequestIdentity(request, isTrustedProxy);
+    const session = getSession(request);
     const url = new URL(request.url || '/', 'http://localhost');
     const path = url.pathname;
     try {
@@ -564,8 +827,7 @@ export function createPackyApp({
         return;
       }
       if (request.method === 'GET' && path === '/api/me') {
-        if (!identity.clientIp) throw new PublicError(400, '无法识别来源 IP。');
-        sendJson(response, 200, await getPrivatePayload(identity.clientIp));
+        sendJson(response, 200, await getPrivatePayload(requireSession(session)));
         return;
       }
       if (request.method === 'POST' && path === '/api/accounts/register') {
@@ -579,42 +841,48 @@ export function createPackyApp({
         }
         const fingerprint = store.fingerprint(key);
         let account = store.findByFingerprint(fingerprint);
+        let created = false;
         if (account) {
           store.bindIp(account.id, identity.clientIp, Math.floor(nowMs() / 1000));
-          limiter.clear(identity.clientIp);
-          sendJson(response, 200, { ok: true, account: { id: account.id, name: account.name, leaderboardEnabled: Boolean(account.leaderboard_enabled) } });
-          return;
-        }
-        let data;
-        try {
-          data = await queryUsage(key);
-        } catch {
-          limiter.fail(identity.clientIp);
-          throw new PublicError(400, 'Key 无效，或 PackyAPI 暂时无法查询。');
+        } else {
+          let data;
+          try {
+            data = await queryUsage(key);
+          } catch {
+            limiter.fail(identity.clientIp);
+            throw new PublicError(400, 'Key 无效，或 PackyAPI 暂时无法查询。');
+          }
+          const timestamp = Math.floor(nowMs() / 1000);
+          const name = String(data.name || 'PackyAPI 账号').trim() || 'PackyAPI 账号';
+          try {
+            account = store.createAccount({ key, name, origin, ip: identity.clientIp, now: timestamp });
+            created = true;
+          } catch (error) {
+            if (!String(error.message).includes('UNIQUE constraint failed')) throw error;
+            account = store.findByFingerprint(fingerprint);
+            store.bindIp(account.id, identity.clientIp, timestamp);
+          }
+          primeUsage(account, data, nowMs());
         }
         const timestamp = Math.floor(nowMs() / 1000);
-        const name = String(data.name || 'PackyAPI 账号').trim() || 'PackyAPI 账号';
-        try {
-          account = store.createAccount({ key, name, origin, ip: identity.clientIp, now: timestamp });
-        } catch (error) {
-          if (!String(error.message).includes('UNIQUE constraint failed')) throw error;
-          account = store.findByFingerprint(fingerprint);
-          store.bindIp(account.id, identity.clientIp, timestamp);
-        }
-        primeUsage(account, data, nowMs());
+        const activeSession = session || store.createSession(timestamp, effectiveSessionTtlSeconds);
+        store.bindSession(activeSession.id, account.id, timestamp);
         limiter.clear(identity.clientIp);
-        sendJson(response, 201, { ok: true, account: { id: account.id, name, leaderboardEnabled: false } });
+        sendJson(response, created ? 201 : 200, { ok: true, account: { id: account.id, name: account.name, leaderboardEnabled: Boolean(account.leaderboard_enabled) } }, { 'Set-Cookie': createSessionCookie(activeSession.token, effectiveSessionTtlSeconds) });
         return;
       }
 
       const leaderboardMatch = path.match(/^\/api\/me\/accounts\/([0-9a-f-]{36})\/leaderboard$/i);
       if (request.method === 'PATCH' && leaderboardMatch) {
         requireMutationSecurity(request, identity);
+        const activeSession = requireSession(session);
         const accountId = leaderboardMatch[1];
-        if (!store.hasIp(accountId, identity.clientIp)) throw new PublicError(404, '未找到可管理的账号。');
+        if (!store.hasSessionAccount(activeSession.id, accountId)) throw new PublicError(404, '未找到可管理的账号。');
         const body = await readJsonBody(request);
         if (typeof body.enabled !== 'boolean') throw new PublicError(400, 'enabled 必须是布尔值。');
-        store.setLeaderboard(accountId, body.enabled, Math.floor(nowMs() / 1000));
+        const changedAt = Math.floor(nowMs() / 1000);
+        store.setLeaderboard(accountId, body.enabled, changedAt);
+        invalidateLeaderboard(changedAt);
         sendJson(response, 200, { ok: true, leaderboardEnabled: body.enabled });
         return;
       }
@@ -622,14 +890,11 @@ export function createPackyApp({
       const unbindMatch = path.match(/^\/api\/me\/accounts\/([0-9a-f-]{36})\/ip$/i);
       if (request.method === 'DELETE' && unbindMatch) {
         requireMutationSecurity(request, identity);
+        const activeSession = requireSession(session);
         const accountId = unbindMatch[1];
-        if (!store.hasIp(accountId, identity.clientIp)) throw new PublicError(404, '未找到可管理的账号。');
-        const result = store.unbindIp(accountId, identity.clientIp);
-        if (result.deletedAccount) {
-          cache.delete(accountId);
-          inFlight.delete(accountId);
-        }
-        sendJson(response, 200, { ok: true, deletedAccount: result.deletedAccount, remainingBindings: result.remaining });
+        if (!store.hasSessionAccount(activeSession.id, accountId)) throw new PublicError(404, '未找到可管理的账号。');
+        const result = store.unbindSession(activeSession.id, accountId);
+        sendJson(response, 200, { ok: true, deletedAccount: false, remainingBindings: result.remaining });
         return;
       }
 
@@ -653,7 +918,9 @@ export function createPackyApp({
       }
       const statusCode = error instanceof PublicError ? error.statusCode : 500;
       const message = error instanceof PublicError ? error.message : '服务器暂时无法处理请求。';
-      sendJson(response, statusCode, { message }, error instanceof PublicError ? error.headers : {});
+      const payload = { message };
+      if (statusCode === 401) payload.requiresAuth = true;
+      sendJson(response, statusCode, payload, error instanceof PublicError ? error.headers : {});
     }
   }
 
@@ -695,7 +962,7 @@ export async function startServer({ argv = process.argv.slice(2), env = process.
   const app = createPackyApp({
     databasePath,
     masterKey,
-    refreshSeconds: Math.max(120, Number(env.REFRESH_INTERVAL_SECONDS || 120)),
+    refreshSeconds: Math.max(DEFAULT_REFRESH_SECONDS, Number(env.REFRESH_INTERVAL_SECONDS || DEFAULT_REFRESH_SECONDS)),
     trustedProxyCidrs,
     packyOrigin: env.PACKY_ORIGIN || DEFAULT_ORIGIN
   });

@@ -10,7 +10,7 @@ USER node
 ENV HOST=0.0.0.0 \
     PORT=8765 \
     DATA_DIR=/data \
-    REFRESH_INTERVAL_SECONDS=120
+    REFRESH_INTERVAL_SECONDS=300
 
 EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

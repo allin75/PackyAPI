@@ -51,7 +51,7 @@ https://your-domain.example/leaderboard
 https://your-domain.example/health
 ```
 
-从两个不同公网 IP 分别输入同一个 Key，应识别为一个账号、两个 IP 绑定。排行榜只应返回账号名称与已用金额。
+在两个不同浏览器会话中输入同一个 Key，应识别为同一个账号；同一出口 IP 下的不同浏览器不应互相看到账号或余额。排行榜只应返回账号名称、已用金额、名次和变化状态，不应包含账号 ID、Key、IP 或剩余额度。
 
 ## 5. 备份和升级
 
