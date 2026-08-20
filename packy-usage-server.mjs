@@ -17,6 +17,7 @@ const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_REFRESH_SECONDS = 5 * 60;
 const HOUR_SECONDS = 60 * 60;
 const DAY_SECONDS = 24 * HOUR_SECONDS;
+const MAX_DAILY_USAGE_RANGE_DAYS = 366;
 const SHANGHAI_OFFSET = '+08:00';
 const SHANGHAI_TIME_ZONE = 'Asia/Shanghai';
 
@@ -63,6 +64,29 @@ class PublicError extends Error {
     this.statusCode = statusCode;
     this.headers = headers;
   }
+}
+
+function parseDateKey(value, fieldName) {
+  const dateKey = String(value || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+    throw new PublicError(400, `${fieldName} 必须是 YYYY-MM-DD 格式。`);
+  }
+  const timestamp = Date.parse(`${dateKey}T00:00:00Z`);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString().slice(0, 10) !== dateKey) {
+    throw new PublicError(400, `${fieldName} 不是有效日期。`);
+  }
+  return { dateKey, dayNumber: Math.floor(timestamp / (DAY_SECONDS * 1000)) };
+}
+
+function parseDailyUsageRange(searchParams) {
+  const start = parseDateKey(searchParams.get('start'), 'start');
+  const end = parseDateKey(searchParams.get('end'), 'end');
+  const totalDays = end.dayNumber - start.dayNumber + 1;
+  if (totalDays < 1) throw new PublicError(400, 'start 不能晚于 end。');
+  if (totalDays > MAX_DAILY_USAGE_RANGE_DAYS) {
+    throw new PublicError(400, `日期范围不能超过 ${MAX_DAILY_USAGE_RANGE_DAYS} 天。`);
+  }
+  return { start: start.dateKey, end: end.dateKey, totalDays };
 }
 
 export function normalizeIp(value) {
@@ -409,6 +433,15 @@ export class AccountStore {
       FROM daily_usage_snapshots
       WHERE account_id = ? AND usage_date = ?
     `).get(accountId, usageDate) || null;
+  }
+
+  readDailyUsageRange(accountId, start, end) {
+    return this.db.prepare(`
+      SELECT usage_date, daily_used, calculation_status
+      FROM daily_usage_snapshots
+      WHERE account_id = ? AND usage_date >= ? AND usage_date <= ?
+      ORDER BY usage_date
+    `).all(accountId, start, end);
   }
 
   completeDailyUsage(accountId, usageDate, { cumulativeUsed, quotaPeriodStart, capturedAt }) {
@@ -1013,6 +1046,28 @@ export function createPackyApp({
       }
       if (request.method === 'GET' && path === '/api/me') {
         sendJson(response, 200, await getPrivatePayload(requireSession(session)));
+        return;
+      }
+
+      const dailyUsageMatch = path.match(/^\/api\/me\/accounts\/([0-9a-f-]{36})\/daily-usage$/i);
+      if (request.method === 'GET' && dailyUsageMatch) {
+        const activeSession = requireSession(session);
+        const accountId = dailyUsageMatch[1];
+        if (!store.hasSessionAccount(activeSession.id, accountId)) throw new PublicError(404, '未找到可查看的账号。');
+        const range = parseDailyUsageRange(url.searchParams);
+        const rows = new Map(store.readDailyUsageRange(accountId, range.start, range.end).map((row) => [row.usage_date, row]));
+        const points = Array.from({ length: range.totalDays }, (_, index) => {
+          const date = shiftDateKey(range.start, index);
+          const row = rows.get(date);
+          const status = row?.calculation_status || 'missing';
+          const dailyUsed = Number(row?.daily_used);
+          const used = row?.daily_used !== null && row?.daily_used !== undefined
+            && (status === 'complete' || status === 'reset_adjusted') && Number.isFinite(dailyUsed)
+            ? dailyUsed
+            : null;
+          return { date, used, status };
+        });
+        sendJson(response, 200, { start: range.start, end: range.end, points });
         return;
       }
       if (request.method === 'POST' && path === '/api/accounts/register') {

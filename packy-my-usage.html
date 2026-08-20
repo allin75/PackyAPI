@@ -47,9 +47,10 @@
   </main>
 
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script src="https://unpkg.com/chart.js@4.4.7/dist/chart.umd.js"></script>
   <script>
     (() => {
-      const state = { accounts: [], refreshSeconds: 300, nextRefreshAt: Date.now() + 300000, loading: false, authenticated: false };
+      const state = { accounts: [], refreshSeconds: 300, nextRefreshAt: Date.now() + 300000, loading: false, authenticated: false, weekViews: new Map() };
       const $ = (id) => document.getElementById(id);
       const elements = {
         refreshButton: $("refreshButton"), themeButton: $("themeButton"), updatedLabel: $("updatedLabel"), countdown: $("countdown"),
@@ -59,9 +60,34 @@
       };
       const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
       const decimal = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const weekLabels = ["一", "二", "三", "四", "五", "六", "日"];
       function icons() { if (window.lucide) window.lucide.createIcons({ attrs: { "stroke-width": 1.8 } }); }
       function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[char]); }
       function formatDuration(seconds) { const safe = Math.max(0, Math.ceil(seconds)); return `${String(Math.floor(safe / 60)).padStart(2,"0")}:${String(safe % 60).padStart(2,"0")}`; }
+      function toDateKey(date) { return date.toISOString().slice(0, 10); }
+      function parseDateKey(dateKey) { return new Date(`${dateKey}T00:00:00Z`); }
+      function addDays(dateKey, days) { const date = parseDateKey(dateKey); date.setUTCDate(date.getUTCDate() + days); return toDateKey(date); }
+      function weekStartFor(dateKey) { const date = parseDateKey(dateKey); const day = date.getUTCDay(); return addDays(dateKey, day === 0 ? -6 : 1 - day); }
+      function shanghaiToday() {
+        const parts = Object.fromEntries(new Intl.DateTimeFormat("en", { timeZone:"Asia/Shanghai", year:"numeric", month:"2-digit", day:"2-digit" }).formatToParts(new Date()).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+        return `${parts.year}-${parts.month}-${parts.day}`;
+      }
+      function weekDates(weekStart) { return Array.from({ length:7 }, (_, index) => addDays(weekStart, index)); }
+      function weekView(accountId) {
+        if (!state.weekViews.has(accountId)) state.weekViews.set(accountId, { weekStart:weekStartFor(shanghaiToday()), cache:new Map(), requestId:0, chart:null });
+        return state.weekViews.get(accountId);
+      }
+      function monthLabel(dates) {
+        const first = parseDateKey(dates[0]); const last = parseDateKey(dates[6]);
+        if (first.getUTCFullYear() !== last.getUTCFullYear()) return `${first.getUTCFullYear()}年${first.getUTCMonth() + 1}月 / ${last.getUTCFullYear()}年${last.getUTCMonth() + 1}月`;
+        if (first.getUTCMonth() !== last.getUTCMonth()) return `${first.getUTCMonth() + 1}月 / ${last.getUTCMonth() + 1}月`;
+        return `${first.getUTCMonth() + 1}月`;
+      }
+      function withAlpha(color, alpha) {
+        const hex = String(color).trim().match(/^#([0-9a-f]{6})$/i);
+        if (hex) { const value = Number.parseInt(hex[1], 16); return `rgba(${value >> 16},${(value >> 8) & 255},${value & 255},${alpha})`; }
+        const rgb = String(color).match(/[\d.]+/g); return rgb?.length >= 3 ? `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})` : color;
+      }
       function showError(message) { elements.errorText.textContent = message; elements.errorBanner.classList.add("is-visible"); }
       function clearError() { elements.errorText.textContent = ""; elements.errorBanner.classList.remove("is-visible"); }
       function showSuccess(message) { elements.successText.textContent = message; elements.successBanner.classList.add("is-visible"); window.setTimeout(() => elements.successBanner.classList.remove("is-visible"), 5000); }
@@ -71,12 +97,137 @@
         if (account.stale) return { label:"缓存数据", className:"is-stale" };
         return { label:"数据正常", className:"" };
       }
+      function weeklyMarkup(account) {
+        return `<section class="weekly-usage" aria-label="${escapeHtml(account.name)} 周用量">
+          <div class="weekly-heading"><h4>周用量</h4><div class="weekly-total"><span>本周合计</span><strong data-week-total>—</strong></div></div>
+          <div class="weekly-transition" data-week-transition>
+            <div class="week-navigator">
+              <button class="icon-button week-arrow" type="button" data-week-action="previous" data-account-id="${escapeHtml(account.id)}" aria-label="上一周"><i data-lucide="chevron-left" aria-hidden="true"></i></button>
+              <div class="week-date-control">
+                <button class="week-date-button" type="button" data-week-action="pick" data-account-id="${escapeHtml(account.id)}" aria-label="选择日期">
+                  <span class="week-month" data-week-month></span>
+                  <span class="week-days" data-week-days></span>
+                  <span class="week-weekdays">${weekLabels.map((label) => `<span>${label}</span>`).join("")}</span>
+                </button>
+                <input class="week-date-input" type="date" data-week-input data-account-id="${escapeHtml(account.id)}" aria-label="选择要查看的日期">
+              </div>
+              <button class="icon-button week-arrow" type="button" data-week-action="next" data-account-id="${escapeHtml(account.id)}" aria-label="下一周"><i data-lucide="chevron-right" aria-hidden="true"></i></button>
+            </div>
+            <div class="weekly-chart-frame">
+              <canvas data-week-chart role="img" aria-label="${escapeHtml(account.name)} 周一至周日用量曲线"></canvas>
+              <div class="weekly-chart-status" data-week-status role="status"><i data-lucide="loader-circle" aria-hidden="true"></i><span>正在读取本周数据</span></div>
+            </div>
+          </div>
+        </section>`;
+      }
+      function accountCard(accountId) { return elements.accountList.querySelector(`.account-card[data-account-id="${accountId}"]`); }
+      function destroyChart(view) { if (view.chart) { view.chart.destroy(); view.chart = null; } }
+      function setWeekStatus(card, type, message) {
+        const status = card.querySelector("[data-week-status]");
+        status.className = `weekly-chart-status is-${type}`;
+        status.innerHTML = type === "error"
+          ? `<span>${escapeHtml(message)}</span><button class="button week-retry" type="button">重试</button>`
+          : `<i data-lucide="${type === "loading" ? "loader-circle" : "calendar-days"}" aria-hidden="true"></i><span>${escapeHtml(message)}</span>`;
+        status.hidden = false;
+        if (type === "error") status.querySelector(".week-retry").addEventListener("click", () => loadWeek(card.dataset.accountId, true));
+        icons();
+      }
+      function renderChart(card, view, points) {
+        destroyChart(view);
+        const values = points.map((point) => Number.isFinite(point.used) ? Number(point.used) : null);
+        const valid = values.filter(Number.isFinite);
+        card.querySelector("[data-week-total]").textContent = valid.length ? money.format(valid.reduce((sum, value) => sum + value, 0)) : "—";
+        if (!window.Chart) { setWeekStatus(card, "error", "图表组件加载失败"); return; }
+        const status = card.querySelector("[data-week-status]");
+        status.hidden = valid.length > 0;
+        if (!valid.length) setWeekStatus(card, "empty", "本周暂无用量数据");
+        const styles = getComputedStyle(document.documentElement);
+        const primary = styles.getPropertyValue("--primary").trim();
+        const muted = styles.getPropertyValue("--muted").trim();
+        const border = styles.getPropertyValue("--border").trim();
+        const surface = styles.getPropertyValue("--surface").trim();
+        const canvas = card.querySelector("[data-week-chart]");
+        const weekScaleAlignment = { id:"weekScaleAlignment", afterLayout:(chart) => {
+          const columns = card.querySelectorAll("[data-week-days] span");
+          const canvasRect = chart.canvas.getBoundingClientRect();
+          const firstRect = columns[0]?.getBoundingClientRect(); const lastRect = columns[6]?.getBoundingClientRect();
+          if (!firstRect || !lastRect || !chart.scales.x) return;
+          const left = firstRect.left + firstRect.width / 2 - canvasRect.left;
+          const right = lastRect.left + lastRect.width / 2 - canvasRect.left;
+          const scale = chart.scales.x;
+          scale.left = left; scale.right = right; scale.width = right - left;
+          scale._startPixel = left; scale._endPixel = right; scale._length = right - left;
+        } };
+        view.chart = new Chart(canvas, {
+          type:"line",
+          data:{ labels:weekLabels, datasets:[{ data:values, borderColor:primary, backgroundColor:withAlpha(primary,.12), pointBackgroundColor:surface, pointBorderColor:primary, pointBorderWidth:2, pointRadius:3.5, pointHoverRadius:5, pointHitRadius:14, borderWidth:2, tension:.32, fill:true, spanGaps:false }] },
+          plugins:[weekScaleAlignment],
+          options:{ responsive:true, maintainAspectRatio:false, animation:false, interaction:{ mode:"nearest", intersect:true }, plugins:{ legend:{ display:false }, tooltip:{ displayColors:false, callbacks:{ title:(items) => { const index = items[0]?.dataIndex ?? 0; const point = points[index]; return `${point.date} 星期${weekLabels[index]}`; }, label:(item) => Number.isFinite(item.raw) ? `用量 ${money.format(Number(item.raw))}` : "暂无数据", afterLabel:(item) => points[item.dataIndex]?.status === "reset_adjusted" ? "额度周期已重置" : "" } } }, scales:{ x:{ grid:{ display:false }, border:{ display:false }, ticks:{ display:false } }, y:{ beginAtZero:true, grace:"10%", border:{ display:false }, grid:{ color:withAlpha(border,.65) }, ticks:{ color:muted, maxTicksLimit:5, callback:(value) => `$${value}` } } } }
+        });
+      }
+      function animateWeek(card, direction) {
+        if (!direction) return;
+        const transition = card.querySelector("[data-week-transition]");
+        transition.classList.remove("week-slide-previous", "week-slide-next");
+        void transition.offsetWidth;
+        transition.classList.add(direction === "previous" ? "week-slide-previous" : "week-slide-next");
+      }
+      function renderWeek(accountId, direction = "") {
+        const card = accountCard(accountId); if (!card) return;
+        const view = weekView(accountId); const dates = weekDates(view.weekStart); const currentWeek = weekStartFor(shanghaiToday());
+        card.querySelector("[data-week-month]").textContent = monthLabel(dates);
+        card.querySelector("[data-week-days]").innerHTML = dates.map((date) => `<span>${Number(date.slice(8))}</span>`).join("");
+        const dateButton = card.querySelector('[data-week-action="pick"]');
+        dateButton.setAttribute("aria-label", `${dates[0]} 至 ${dates[6]}，选择日期`);
+        const dateInput = card.querySelector("[data-week-input]"); dateInput.value = view.weekStart; dateInput.max = shanghaiToday();
+        card.querySelector('[data-week-action="next"]').disabled = view.weekStart >= currentWeek;
+        animateWeek(card, direction);
+        const cached = view.cache.get(view.weekStart);
+        if (cached) renderChart(card, view, cached.points);
+        else { destroyChart(view); card.querySelector("[data-week-total]").textContent = "—"; setWeekStatus(card, "loading", "正在读取本周数据"); }
+      }
+      async function loadWeek(accountId, force = false) {
+        const view = weekView(accountId); const requestedWeek = view.weekStart;
+        if (!force && view.cache.has(requestedWeek)) { renderWeek(accountId); return; }
+        const requestId = ++view.requestId; renderWeek(accountId);
+        try {
+          const end = addDays(requestedWeek, 6);
+          const payload = await requestJson(`/api/me/accounts/${encodeURIComponent(accountId)}/daily-usage?start=${requestedWeek}&end=${end}`);
+          view.cache.set(requestedWeek, { points:Array.isArray(payload.points) ? payload.points : [] });
+          if (view.requestId === requestId && view.weekStart === requestedWeek) renderWeek(accountId);
+        } catch (error) {
+          if (view.requestId !== requestId || view.weekStart !== requestedWeek) return;
+          const card = accountCard(accountId); if (card) setWeekStatus(card, "error", error.message || "无法读取本周数据");
+        }
+      }
+      function changeWeek(accountId, days, direction) {
+        const view = weekView(accountId); const next = addDays(view.weekStart, days); const currentWeek = weekStartFor(shanghaiToday());
+        view.weekStart = next > currentWeek ? currentWeek : next; view.requestId += 1;
+        renderWeek(accountId, direction); loadWeek(accountId);
+      }
+      function bindWeekControls(card) {
+        const accountId = card.dataset.accountId;
+        card.querySelectorAll("[data-week-action]").forEach((button) => button.addEventListener("click", () => {
+          const action = button.dataset.weekAction;
+          if (action === "previous") changeWeek(accountId, -7, "previous");
+          if (action === "next") changeWeek(accountId, 7, "next");
+          if (action === "pick") { const input = card.querySelector("[data-week-input]"); input.focus({ preventScroll:true }); if (input.showPicker) input.showPicker(); else input.click(); }
+        }));
+        card.querySelector("[data-week-input]").addEventListener("change", (event) => {
+          if (!event.currentTarget.value) return;
+          const view = weekView(accountId); const target = weekStartFor(event.currentTarget.value); const currentWeek = weekStartFor(shanghaiToday());
+          const safeTarget = target > currentWeek ? currentWeek : target; const direction = safeTarget < view.weekStart ? "previous" : (safeTarget > view.weekStart ? "next" : "");
+          view.weekStart = safeTarget; view.requestId += 1; renderWeek(accountId, direction); loadWeek(accountId);
+        });
+      }
       function renderAccounts() {
         elements.loadingState.hidden = true;
         const hasAccounts = state.accounts.length > 0;
         elements.emptyState.hidden = hasAccounts;
         elements.accountList.hidden = !hasAccounts;
         elements.accountCount.textContent = `${state.accounts.length} 个账号`;
+        const activeIds = new Set(state.accounts.map((account) => account.id));
+        for (const [accountId, view] of state.weekViews) { destroyChart(view); if (!activeIds.has(accountId)) state.weekViews.delete(accountId); }
         elements.accountList.innerHTML = state.accounts.map((account) => {
           const available = account.status !== "error" && account.used !== null;
           const rate = available ? Number(account.usageRate || 0) : 0;
@@ -91,6 +242,7 @@
               <div class="metric"><div class="metric-label">总额度</div><div class="metric-value">${available ? money.format(Number(account.total)) : "—"}</div></div>
             </div>
             <div class="usage-progress" role="progressbar" aria-label="${escapeHtml(account.name)} 使用率" aria-valuenow="${rate}" aria-valuemin="0" aria-valuemax="100"><div class="usage-progress-bar" style="width:${Math.min(100,Math.max(0,rate))}%"></div></div>
+            ${weeklyMarkup(account)}
             <div class="account-actions">
               <label class="switch-control"><input class="leaderboard-toggle" type="checkbox" data-account-id="${escapeHtml(account.id)}" ${account.leaderboardEnabled ? "checked" : ""}><span class="switch-track" aria-hidden="true"></span><span>加入排行榜</span></label>
           <button class="button button-danger unbind-button" type="button" data-account-id="${escapeHtml(account.id)}" data-account-name="${escapeHtml(account.name)}"><i data-lucide="unlink" aria-hidden="true"></i><span>移除当前会话</span></button>
@@ -99,6 +251,7 @@
         }).join("");
         elements.accountList.querySelectorAll(".leaderboard-toggle").forEach((input) => input.addEventListener("change", toggleLeaderboard));
         elements.accountList.querySelectorAll(".unbind-button").forEach((button) => button.addEventListener("click", unbindAccount));
+        elements.accountList.querySelectorAll(".account-card").forEach((card) => { bindWeekControls(card); renderWeek(card.dataset.accountId); loadWeek(card.dataset.accountId); });
         icons();
       }
       async function loadAccounts() {
@@ -144,7 +297,7 @@
         finally { elements.keyInput.disabled = false; elements.registerButton.disabled = false; elements.keyInput.focus(); }
       }
       function updateCountdown() { const remaining = (state.nextRefreshAt - Date.now()) / 1000; elements.countdown.textContent = formatDuration(remaining); const ready = remaining <= 0 && !state.loading; elements.refreshButton.disabled = !ready; if (ready) loadAccounts(); }
-      function applyTheme(theme) { document.documentElement.dataset.theme = theme; elements.themeButton.innerHTML = `<i data-lucide="${theme === "dark" ? "sun" : "moon"}" aria-hidden="true"></i>`; icons(); }
+      function applyTheme(theme) { document.documentElement.dataset.theme = theme; elements.themeButton.innerHTML = `<i data-lucide="${theme === "dark" ? "sun" : "moon"}" aria-hidden="true"></i>`; state.weekViews.forEach((view, accountId) => { if (view.cache.has(view.weekStart)) renderWeek(accountId); }); icons(); }
       function initTheme() { const saved = localStorage.getItem("packy-theme"); applyTheme(saved || (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light")); }
       elements.keyForm.addEventListener("submit", registerAccount);
       elements.revealButton.addEventListener("click", () => { const revealing = elements.keyInput.type === "password"; elements.keyInput.type = revealing ? "text" : "password"; elements.revealButton.setAttribute("aria-label", revealing ? "隐藏 Key" : "显示 Key"); elements.revealButton.innerHTML = `<i data-lucide="${revealing ? "eye-off" : "eye"}" aria-hidden="true"></i>`; icons(); });

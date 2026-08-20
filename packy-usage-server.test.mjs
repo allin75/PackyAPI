@@ -509,6 +509,91 @@ test('stores one daily snapshot per account and exposes yesterday usage only to 
   assert.ok(!JSON.stringify(leaderboard.body).includes('yesterdayUsed'));
 });
 
+test('returns a dense private daily usage range only to the owning session', async (t) => {
+  const provider = async (key) => {
+    if (key === KEY_A) return packyData('weekly-account-A', 100, 100);
+    if (key === KEY_B) return packyData('weekly-account-B', 50, 150);
+    throw new Error('invalid key');
+  };
+  const fixture = await createFixture({ provider });
+  t.after(() => fixture.close());
+
+  const ownerJar = {};
+  const otherJar = {};
+  const registration = await fixture.request('203.0.113.100', '/api/accounts/register', {
+    method: 'POST', body: { key: KEY_A }, jar: ownerJar
+  });
+  const accountId = registration.body.account.id;
+  await fixture.request('203.0.113.101', '/api/accounts/register', {
+    method: 'POST', body: { key: KEY_B }, jar: otherJar
+  });
+
+  const insert = fixture.app.store.db.prepare(`
+    INSERT INTO daily_usage_snapshots (
+      account_id, usage_date, cumulative_used, daily_used, quota_period_start,
+      capture_succeeded, calculation_status, scheduled_at, captured_at, delayed
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+  `);
+  insert.run(accountId, '2026-08-17', 112.5, 12.5, 1700000000, 1, 'complete', 1, 1);
+  insert.run(accountId, '2026-08-18', null, null, null, 0, 'capture_failed', 2, 2);
+  insert.run(accountId, '2026-08-19', 4.25, 4.25, 1800000000, 1, 'reset_adjusted', 3, 3);
+
+  const response = await fixture.request(
+    '203.0.113.100',
+    `/api/me/accounts/${accountId}/daily-usage?start=2026-08-17&end=2026-08-23`,
+    { jar: ownerJar }
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, {
+    start: '2026-08-17',
+    end: '2026-08-23',
+    points: [
+      { date: '2026-08-17', used: 12.5, status: 'complete' },
+      { date: '2026-08-18', used: null, status: 'capture_failed' },
+      { date: '2026-08-19', used: 4.25, status: 'reset_adjusted' },
+      { date: '2026-08-20', used: null, status: 'missing' },
+      { date: '2026-08-21', used: null, status: 'missing' },
+      { date: '2026-08-22', used: null, status: 'missing' },
+      { date: '2026-08-23', used: null, status: 'missing' }
+    ]
+  });
+
+  const anonymous = await fixture.request(
+    '203.0.113.102',
+    `/api/me/accounts/${accountId}/daily-usage?start=2026-08-17&end=2026-08-23`,
+    { cookie: null }
+  );
+  assert.equal(anonymous.status, 401);
+
+  const otherSession = await fixture.request(
+    '203.0.113.101',
+    `/api/me/accounts/${accountId}/daily-usage?start=2026-08-17&end=2026-08-23`,
+    { jar: otherJar }
+  );
+  assert.equal(otherSession.status, 404);
+});
+
+test('validates private daily usage date ranges and caps them at 366 days', async (t) => {
+  const fixture = await createFixture({ provider: async () => packyData('range-account', 10, 90) });
+  t.after(() => fixture.close());
+  const registration = await fixture.request('203.0.113.103', '/api/accounts/register', { method: 'POST', body: { key: KEY_A } });
+  const endpoint = `/api/me/accounts/${registration.body.account.id}/daily-usage`;
+
+  for (const query of [
+    '',
+    '?start=2026-02-30&end=2026-03-01',
+    '?start=2026-08-20&end=2026-08-19',
+    '?start=2025-01-01&end=2026-01-02'
+  ]) {
+    const response = await fixture.request('203.0.113.103', `${endpoint}${query}`);
+    assert.equal(response.status, 400, query);
+  }
+
+  const maximum = await fixture.request('203.0.113.103', `${endpoint}?start=2025-01-01&end=2026-01-01`);
+  assert.equal(maximum.status, 200);
+  assert.equal(maximum.body.points.length, 366);
+});
+
 test('continues daily capture after failures and handles quota resets without negative usage', async (t) => {
   let phase = 1;
   let activeCalls = 0;
@@ -625,6 +710,24 @@ test('uses the simplified packycode brand and session wording', () => {
   const css = readFileSync(new URL('./packy-usage.css', import.meta.url), 'utf8');
   assert.match(css, /\.account-metrics \{[^}]*grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/);
   assert.match(css, /@media \(max-width:520px\)[\s\S]*\.account-metrics \{ grid-template-columns:1fr 1fr;/);
+});
+
+test('renders an accessible per-account weekly usage chart with directional week navigation', () => {
+  const html = readFileSync(new URL('./packy-my-usage.html', import.meta.url), 'utf8');
+  const css = readFileSync(new URL('./packy-usage.css', import.meta.url), 'utf8');
+  assert.match(html, /chart\.umd(?:\.min)?\.js/);
+  assert.match(html, /class="weekly-usage"/);
+  assert.match(html, /class="week-month"/);
+  assert.match(html, /class="week-days"/);
+  assert.match(html, /class="week-weekdays"/);
+  assert.match(html, /showPicker/);
+  assert.match(html, /daily-usage\?start=/);
+  assert.match(html, /aria-label="上一周"/);
+  assert.match(html, /aria-label="下一周"/);
+  assert.match(css, /@keyframes week-enter-previous/);
+  assert.match(css, /@keyframes week-enter-next/);
+  assert.match(css, /\.weekly-chart-frame \{[^}]*height:/);
+  assert.match(css, /@media \(prefers-reduced-motion:reduce\)/);
 });
 
 test('refreshes leaderboard immediately after toggles and reuses private usage cache', async (t) => {

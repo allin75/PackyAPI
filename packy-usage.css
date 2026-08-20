@@ -69,6 +69,34 @@ h3 { overflow-wrap:anywhere; }
 .metric-value { margin-top:4px; font-size:20px; font-weight:500; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
 .usage-progress { height:7px; margin-top:15px; overflow:hidden; border-radius:4px; background:var(--track); }
 .usage-progress-bar { height:100%; background:var(--blue); }
+.weekly-usage { min-width:0; margin-top:18px; padding-top:16px; border-top:1px solid var(--border); }
+.weekly-heading { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; }
+.weekly-heading h4 { margin:0; font-size:15px; font-weight:500; }
+.weekly-total { display:flex; align-items:baseline; gap:7px; color:var(--muted); font-size:12px; }
+.weekly-total strong { color:var(--text); font-size:15px; font-weight:500; font-variant-numeric:tabular-nums; }
+.weekly-transition { min-width:0; overflow:hidden; transform:translateZ(0); }
+.week-slide-previous { animation:week-enter-previous .28s ease both; }
+.week-slide-next { animation:week-enter-next .28s ease both; }
+.week-navigator { min-width:0; display:grid; grid-template-columns:36px minmax(0,1fr) 36px; align-items:center; gap:10px; margin-top:12px; }
+.week-arrow { align-self:center; }
+.week-date-control { position:relative; min-width:0; }
+.week-date-button { width:100%; min-width:0; display:grid; gap:4px; padding:4px 8px 6px; border:0; border-radius:6px; background:transparent; color:var(--text); }
+.week-date-button:hover { background:var(--surface-muted); }
+.week-date-button:focus-visible,.week-arrow:focus-visible,.week-retry:focus-visible { outline:3px solid color-mix(in srgb,var(--primary) 28%,transparent); outline-offset:2px; }
+.week-month { font-size:16px; font-weight:500; line-height:1.35; }
+.week-days,.week-weekdays { min-width:0; display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); align-items:center; }
+.week-days { color:var(--text); font-size:13px; font-weight:500; font-variant-numeric:tabular-nums; }
+.week-weekdays { color:var(--muted); font-size:11px; }
+.week-days span,.week-weekdays span { min-width:0; text-align:center; }
+.week-date-input { position:absolute; width:1px; height:1px; left:50%; bottom:0; padding:0; border:0; opacity:0; pointer-events:none; }
+.weekly-chart-frame { position:relative; width:100%; height:238px; margin-top:8px; }
+.weekly-chart-frame canvas { width:100% !important; height:100% !important; }
+.weekly-chart-status { position:absolute; inset:0; z-index:2; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:9px; color:var(--muted); text-align:center; pointer-events:none; }
+.weekly-chart-status[hidden] { display:none; }
+.weekly-chart-status svg { width:22px; height:22px; color:var(--primary); }
+.weekly-chart-status.is-loading svg { animation:spin 1s linear infinite; }
+.weekly-chart-status.is-error { background:color-mix(in srgb,var(--surface) 88%,transparent); color:var(--red); }
+.weekly-chart-status.is-error .week-retry { min-height:32px; pointer-events:auto; }
 .account-actions { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:15px; padding-top:14px; border-top:1px solid var(--border); }
 .switch-control { display:inline-flex; align-items:center; gap:9px; cursor:pointer; }
 .switch-control input { position:absolute; opacity:0; pointer-events:none; }
@@ -83,6 +111,8 @@ h3 { overflow-wrap:anywhere; }
 .state-stack svg { width:28px; height:28px; color:var(--primary); }
 .loading-state .state-stack svg { animation:spin 1s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
+@keyframes week-enter-previous { from { opacity:.3; transform:translateX(-18px); } to { opacity:1; transform:translateX(0); } }
+@keyframes week-enter-next { from { opacity:.3; transform:translateX(18px); } to { opacity:1; transform:translateX(0); } }
 .leaderboard-shell { overflow:hidden; background:var(--race-bg); border:1px solid var(--race-line); border-radius:12px; box-shadow:0 16px 40px rgba(10,18,25,.18); color:var(--race-text); }
 .leaderboard-header { min-height:76px; display:flex; align-items:center; justify-content:space-between; gap:18px; padding:13px 20px; border-bottom:1px solid var(--race-line); background:linear-gradient(105deg,var(--race-panel-strong),var(--race-bg)); }
 .leaderboard-kicker { display:block; margin-bottom:5px; color:var(--race-green); font-size:10px; font-weight:700; letter-spacing:.16em; }
@@ -159,6 +189,10 @@ h3 { overflow-wrap:anywhere; }
   .account-card { padding:13px; }
   .account-metrics { grid-template-columns:1fr 1fr; gap:10px; }
   .metric-value { font-size:18px; }
+  .week-navigator { grid-template-columns:34px minmax(0,1fr) 34px; gap:5px; }
+  .week-date-button { padding-inline:2px; }
+  .week-month { font-size:15px; }
+  .weekly-chart-frame { height:210px; }
   .account-actions { align-items:flex-start; flex-direction:column; }
   .account-actions .button { width:100%; }
   .podium-card { min-height:196px; padding-inline:12px; }
