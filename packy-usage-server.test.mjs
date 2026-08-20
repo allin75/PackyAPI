@@ -9,9 +9,11 @@ import {
   AccountStore,
   createPackyApp,
   createTrustedProxyMatcher,
+  nextDailyCaptureAt,
   nextHourlyRefreshAt,
   normalizeIp,
-  resolveRequestIdentity
+  resolveRequestIdentity,
+  shanghaiDateKey
 } from './packy-usage-server.mjs';
 
 const KEY_A = `sk-${'a'.repeat(32)}`;
@@ -19,14 +21,14 @@ const KEY_B = `sk-${'b'.repeat(32)}`;
 const KEY_C = `sk-${'c'.repeat(32)}`;
 const EMPTY_STATIC = { my: Buffer.from('my'), leaderboard: Buffer.from('leaderboard'), css: Buffer.from('css') };
 
-function packyData(name, used, remaining = 100) {
+function packyData(name, used, remaining = 100, quotaPeriodStart = 1700000000) {
   return {
     name,
     total_used: used * 500000,
     total_available: remaining * 500000,
     unlimited_quota: false,
     quota_reset_period: 'monthly',
-    quota_period_start: 1700000000,
+    quota_period_start: quotaPeriodStart,
     expires_at: 1800000000
   };
 }
@@ -48,6 +50,7 @@ async function createFixture({ provider, startTime = 1_800_000_000_000 } = {}) {
       trustedProxyCidrs: ['127.0.0.1', '::1'],
       usageProvider: provider,
       leaderboardRequestSpacingMs: 0,
+      dailyRequestSpacingMs: 0,
       nowMs: () => currentTime,
       staticFiles: EMPTY_STATIC
     });
@@ -86,14 +89,15 @@ async function createFixture({ provider, startTime = 1_800_000_000_000 } = {}) {
     databasePath,
     request,
     advance(milliseconds) { currentTime += milliseconds; },
+    setTime(milliseconds) { currentTime = milliseconds; },
     async restart() {
       await new Promise((resolveClose) => server.close(resolveClose));
-      app.close();
+      await app.close();
       await start();
     },
     async close() {
       await new Promise((resolveClose) => server.close(resolveClose));
-      app.close();
+      await app.close();
       const resolvedDirectory = resolve(directory);
       assert.ok(resolvedDirectory.startsWith(resolve(tmpdir())));
       rmSync(resolvedDirectory, { recursive: true, force: true });
@@ -128,7 +132,17 @@ test('aligns leaderboard refreshes to the next natural hour', () => {
   assert.equal(nextHourlyRefreshAt(1_800_003_600), 1_800_007_200);
 });
 
-test('migrates a version 1 database to version 3 without losing accounts', () => {
+test('aligns daily usage captures to 23:00 in Asia/Shanghai', () => {
+  const beforeBoundary = Date.parse('2026-08-20T22:59:59+08:00') / 1000;
+  const atBoundary = Date.parse('2026-08-20T23:00:00+08:00') / 1000;
+  const nextBoundary = Date.parse('2026-08-21T23:00:00+08:00') / 1000;
+
+  assert.equal(shanghaiDateKey(beforeBoundary), '2026-08-20');
+  assert.equal(nextDailyCaptureAt(beforeBoundary), atBoundary);
+  assert.equal(nextDailyCaptureAt(atBoundary), nextBoundary);
+});
+
+test('migrates a version 1 database to version 4 without losing accounts', () => {
   const directory = mkdtempSync(join(tmpdir(), 'packy-usage-migration-'));
   const databasePath = join(directory, 'usage.sqlite');
   const legacy = new DatabaseSync(databasePath);
@@ -159,13 +173,14 @@ test('migrates a version 1 database to version 3 without losing accounts', () =>
   legacy.close();
 
   const store = new AccountStore(databasePath, Buffer.alloc(32, 9));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 3);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 4);
   assert.equal(store.counts().accounts, 1);
   assert.equal(store.listByIp('203.0.113.8')[0].name, 'Legacy');
   assert.ok(store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leaderboard_snapshots'").get());
   assert.ok(store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leaderboard_snapshot_meta'").get());
   assert.ok(store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get());
   assert.ok(store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_accounts'").get());
+  assert.ok(store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'daily_usage_snapshots'").get());
   store.close();
   rmSync(directory, { recursive: true, force: true });
 });
@@ -444,6 +459,146 @@ test('refreshes leaderboard accounts sequentially to avoid upstream bursts', asy
   assert.equal(maximumActiveCalls, 1);
 });
 
+test('stores one daily snapshot per account and exposes yesterday usage only to its session', async (t) => {
+  let used = 100;
+  let calls = 0;
+  const provider = async () => {
+    calls += 1;
+    return packyData('daily-account', used, 100);
+  };
+  const fixture = await createFixture({
+    provider,
+    startTime: Date.parse('2026-08-19T22:50:00+08:00')
+  });
+  t.after(() => fixture.close());
+
+  const registration = await fixture.request('203.0.113.90', '/api/accounts/register', { method: 'POST', body: { key: KEY_A } });
+  const accountId = registration.body.account.id;
+  const firstScheduledAt = Date.parse('2026-08-19T23:00:00+08:00') / 1000;
+  fixture.setTime(firstScheduledAt * 1000);
+  await fixture.app.runDailyCapture({ usageDate: '2026-08-19', scheduledAt: firstScheduledAt, delayed: false });
+
+  used = 125.5;
+  const secondScheduledAt = Date.parse('2026-08-20T23:00:00+08:00') / 1000;
+  fixture.setTime(secondScheduledAt * 1000);
+  await Promise.all([
+    fixture.app.runDailyCapture({ usageDate: '2026-08-20', scheduledAt: secondScheduledAt, delayed: false }),
+    fixture.app.runDailyCapture({ usageDate: '2026-08-20', scheduledAt: secondScheduledAt, delayed: false })
+  ]);
+
+  const callsAfterSnapshots = calls;
+  await fixture.app.runDailyCapture({ usageDate: '2026-08-20', scheduledAt: secondScheduledAt, delayed: true });
+  assert.equal(calls, callsAfterSnapshots);
+  assert.equal(callsAfterSnapshots, 3);
+
+  const row = fixture.app.store.readDailyUsage(accountId, '2026-08-20');
+  assert.deepEqual({ dailyUsed: row.daily_used, status: row.calculation_status, delayed: row.delayed }, {
+    dailyUsed: 25.5,
+    status: 'complete',
+    delayed: 0
+  });
+
+  fixture.setTime(Date.parse('2026-08-21T12:00:00+08:00'));
+  const mine = await fixture.request('203.0.113.90', '/api/me');
+  assert.equal(mine.body.accounts[0].yesterdayUsed, 25.5);
+  assert.equal(mine.body.accounts[0].yesterdayUsageStatus, 'complete');
+
+  const anonymous = await fixture.request('203.0.113.91', '/api/me', { cookie: null });
+  assert.equal(anonymous.status, 401);
+  const leaderboard = await fixture.request('203.0.113.91', '/api/leaderboard');
+  assert.ok(!JSON.stringify(leaderboard.body).includes('yesterdayUsed'));
+});
+
+test('continues daily capture after failures and handles quota resets without negative usage', async (t) => {
+  let phase = 1;
+  let activeCalls = 0;
+  let maximumActiveCalls = 0;
+  const provider = async (key) => {
+    activeCalls += 1;
+    maximumActiveCalls = Math.max(maximumActiveCalls, activeCalls);
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+    activeCalls -= 1;
+    if (phase === 2 && key === KEY_B) throw new Error('temporary outage');
+    if (key === KEY_A) return packyData('Alpha', phase === 1 ? 100 : 115, 100, 1_700_000_000);
+    if (key === KEY_B) return packyData('Bravo', 80, 100, 1_700_000_000);
+    return packyData('Charlie', phase === 1 ? 90 : 12, 100, phase === 1 ? 1_700_000_000 : 1_800_000_000);
+  };
+  const fixture = await createFixture({
+    provider,
+    startTime: Date.parse('2026-08-19T22:50:00+08:00')
+  });
+  t.after(() => fixture.close());
+
+  const accountIds = [];
+  for (const [index, key] of [KEY_A, KEY_B, KEY_C].entries()) {
+    const registration = await fixture.request(`203.0.113.${92 + index}`, '/api/accounts/register', { method: 'POST', body: { key } });
+    accountIds.push(registration.body.account.id);
+  }
+
+  const firstScheduledAt = Date.parse('2026-08-19T23:00:00+08:00') / 1000;
+  fixture.setTime(firstScheduledAt * 1000);
+  await fixture.app.runDailyCapture({ usageDate: '2026-08-19', scheduledAt: firstScheduledAt, delayed: false });
+
+  phase = 2;
+  const secondScheduledAt = Date.parse('2026-08-20T23:00:00+08:00') / 1000;
+  fixture.setTime(secondScheduledAt * 1000);
+  maximumActiveCalls = 0;
+  await fixture.app.runDailyCapture({ usageDate: '2026-08-20', scheduledAt: secondScheduledAt, delayed: false });
+
+  assert.equal(maximumActiveCalls, 1);
+  const rows = accountIds.map((accountId) => fixture.app.store.readDailyUsage(accountId, '2026-08-20'));
+  assert.deepEqual(rows.map((row) => ({ used: row.daily_used, status: row.calculation_status })), [
+    { used: 15, status: 'complete' },
+    { used: null, status: 'capture_failed' },
+    { used: 12, status: 'reset_adjusted' }
+  ]);
+});
+
+test('does not repeat a daily query after a process exits with a pending claim', async (t) => {
+  let calls = 0;
+  const fixture = await createFixture({
+    provider: async () => {
+      calls += 1;
+      return packyData('claimed-account', 20, 80);
+    },
+    startTime: Date.parse('2026-08-20T23:05:00+08:00')
+  });
+  t.after(() => fixture.close());
+
+  const registration = await fixture.request('203.0.113.96', '/api/accounts/register', { method: 'POST', body: { key: KEY_A } });
+  const accountId = registration.body.account.id;
+  const scheduledAt = Date.parse('2026-08-20T23:00:00+08:00') / 1000;
+  assert.equal(fixture.app.store.claimDailyUsage(accountId, '2026-08-20', scheduledAt, true), true);
+
+  await fixture.restart();
+  await fixture.app.runDailyCapture({ usageDate: '2026-08-20', scheduledAt, delayed: true });
+
+  assert.equal(calls, 1);
+  const row = fixture.app.store.readDailyUsage(accountId, '2026-08-20');
+  assert.equal(row.calculation_status, 'capture_failed');
+});
+
+test('runs one delayed capture when the scheduler starts after 23:00', async (t) => {
+  let calls = 0;
+  const fixture = await createFixture({
+    provider: async () => {
+      calls += 1;
+      return packyData('delayed-account', 30, 70);
+    },
+    startTime: Date.parse('2026-08-20T23:05:00+08:00')
+  });
+  t.after(() => fixture.close());
+
+  const registration = await fixture.request('203.0.113.97', '/api/accounts/register', { method: 'POST', body: { key: KEY_A } });
+  await fixture.app.startDailyScheduler();
+  await fixture.app.startDailyScheduler();
+
+  assert.equal(calls, 2);
+  const row = fixture.app.store.readDailyUsage(registration.body.account.id, '2026-08-20');
+  assert.equal(row.delayed, 1);
+  assert.equal(row.calculation_status, 'missing_previous');
+});
+
 test('labels hourly and per-account stale leaderboard data', () => {
   const html = readFileSync(new URL('./packy-key-usage.html', import.meta.url), 'utf8');
   assert.match(html, /整点刷新/);
@@ -465,6 +620,11 @@ test('uses the simplified packycode brand and session wording', () => {
   assert.match(leaderboardHtml, /addEventListener\("storage"/);
   assert.doesNotMatch(myHtml, /团队额度监控|当前 IP 还没有绑定账号/);
   assert.match(myHtml, /请输入 Key 建立浏览器会话/);
+  assert.match(myHtml, /昨日用量/);
+  assert.match(myHtml, /account\.yesterdayUsed/);
+  const css = readFileSync(new URL('./packy-usage.css', import.meta.url), 'utf8');
+  assert.match(css, /\.account-metrics \{[^}]*grid-template-columns:repeat\(4,minmax\(0,1fr\)\)/);
+  assert.match(css, /@media \(max-width:520px\)[\s\S]*\.account-metrics \{ grid-template-columns:1fr 1fr;/);
 });
 
 test('refreshes leaderboard immediately after toggles and reuses private usage cache', async (t) => {

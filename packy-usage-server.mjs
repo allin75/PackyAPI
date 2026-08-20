@@ -16,6 +16,42 @@ const SESSION_COOKIE_NAME = '__Host-packy_session';
 const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_REFRESH_SECONDS = 5 * 60;
 const HOUR_SECONDS = 60 * 60;
+const DAY_SECONDS = 24 * HOUR_SECONDS;
+const SHANGHAI_OFFSET = '+08:00';
+const SHANGHAI_TIME_ZONE = 'Asia/Shanghai';
+
+const shanghaiDateFormatter = new Intl.DateTimeFormat('en', {
+  timeZone: SHANGHAI_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit'
+});
+
+export function shanghaiDateKey(now) {
+  const parts = Object.fromEntries(
+    shanghaiDateFormatter.formatToParts(new Date(Number(now) * 1000))
+      .filter((part) => part.type !== 'literal')
+      .map((part) => [part.type, part.value])
+  );
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function shiftDateKey(dateKey, days) {
+  const [year, month, day] = String(dateKey).split('-').map(Number);
+  if (![year, month, day].every(Number.isInteger)) throw new Error(`Invalid date key: ${dateKey}`);
+  return new Date(Date.UTC(year, month - 1, day) + Number(days) * DAY_SECONDS * 1000).toISOString().slice(0, 10);
+}
+
+function dailyCaptureAt(dateKey) {
+  return Math.floor(Date.parse(`${dateKey}T23:00:00${SHANGHAI_OFFSET}`) / 1000);
+}
+
+export function nextDailyCaptureAt(now) {
+  const current = Number(now);
+  const today = shanghaiDateKey(current);
+  const todayBoundary = dailyCaptureAt(today);
+  return current < todayBoundary ? todayBoundary : dailyCaptureAt(shiftDateKey(today, 1));
+}
 
 export function nextHourlyRefreshAt(now) {
   return (Math.floor(Number(now) / HOUR_SECONDS) + 1) * HOUR_SECONDS;
@@ -161,7 +197,7 @@ export class AccountStore {
       PRAGMA busy_timeout = 5000;
     `);
     const schemaVersion = Number(this.db.prepare('PRAGMA user_version').get().user_version || 0);
-    if (schemaVersion > 3) throw new Error(`Database schema version ${schemaVersion} is newer than this application supports.`);
+    if (schemaVersion > 4) throw new Error(`Database schema version ${schemaVersion} is newer than this application supports.`);
     if (schemaVersion < 1) {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS accounts (
@@ -226,6 +262,28 @@ export class AccountStore {
         );
         CREATE INDEX IF NOT EXISTS session_accounts_account_idx ON session_accounts(account_id);
         PRAGMA user_version = 3;
+        COMMIT;
+      `);
+    }
+    if (schemaVersion < 4) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS daily_usage_snapshots (
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          usage_date TEXT NOT NULL,
+          cumulative_used REAL,
+          daily_used REAL,
+          quota_period_start INTEGER,
+          capture_succeeded INTEGER NOT NULL CHECK (capture_succeeded IN (0, 1)),
+          calculation_status TEXT NOT NULL,
+          scheduled_at INTEGER NOT NULL,
+          captured_at INTEGER,
+          delayed INTEGER NOT NULL DEFAULT 0 CHECK (delayed IN (0, 1)),
+          PRIMARY KEY (account_id, usage_date)
+        );
+        CREATE INDEX IF NOT EXISTS daily_usage_snapshots_date_idx
+          ON daily_usage_snapshots(usage_date, account_id);
+        PRAGMA user_version = 4;
         COMMIT;
       `);
     }
@@ -329,6 +387,69 @@ export class AccountStore {
       WHERE leaderboard_enabled = 1
       ORDER BY name COLLATE NOCASE, id
     `).all();
+  }
+
+  listAll() {
+    return this.db.prepare('SELECT * FROM accounts ORDER BY name COLLATE NOCASE, id').all();
+  }
+
+  claimDailyUsage(accountId, usageDate, scheduledAt, delayed) {
+    return this.db.prepare(`
+      INSERT OR IGNORE INTO daily_usage_snapshots (
+        account_id, usage_date, cumulative_used, daily_used, quota_period_start,
+        capture_succeeded, calculation_status, scheduled_at, captured_at, delayed
+      ) VALUES (?, ?, NULL, NULL, NULL, 0, 'pending', ?, NULL, ?)
+    `).run(accountId, usageDate, scheduledAt, delayed ? 1 : 0).changes > 0;
+  }
+
+  readDailyUsage(accountId, usageDate) {
+    return this.db.prepare(`
+      SELECT account_id, usage_date, cumulative_used, daily_used, quota_period_start,
+             capture_succeeded, calculation_status, scheduled_at, captured_at, delayed
+      FROM daily_usage_snapshots
+      WHERE account_id = ? AND usage_date = ?
+    `).get(accountId, usageDate) || null;
+  }
+
+  completeDailyUsage(accountId, usageDate, { cumulativeUsed, quotaPeriodStart, capturedAt }) {
+    const previous = this.readDailyUsage(accountId, shiftDateKey(usageDate, -1));
+    const currentUsed = round(cumulativeUsed, 6);
+    const previousUsed = Number(previous?.cumulative_used);
+    const previousSucceeded = Boolean(previous?.capture_succeeded) && Number.isFinite(previousUsed);
+    const samePeriod = Number(previous?.quota_period_start || 0) === Number(quotaPeriodStart || 0);
+    let dailyUsed = null;
+    let calculationStatus = 'missing_previous';
+    if (previousSucceeded && samePeriod && currentUsed >= previousUsed) {
+      dailyUsed = round(currentUsed - previousUsed, 6);
+      calculationStatus = 'complete';
+    } else if (previousSucceeded && (!samePeriod || currentUsed < previousUsed)) {
+      dailyUsed = currentUsed;
+      calculationStatus = 'reset_adjusted';
+    }
+    this.db.prepare(`
+      UPDATE daily_usage_snapshots
+      SET cumulative_used = ?, daily_used = ?, quota_period_start = ?, capture_succeeded = 1,
+          calculation_status = ?, captured_at = ?
+      WHERE account_id = ? AND usage_date = ? AND calculation_status = 'pending'
+    `).run(currentUsed, dailyUsed, Number(quotaPeriodStart || 0), calculationStatus, capturedAt, accountId, usageDate);
+    return this.readDailyUsage(accountId, usageDate);
+  }
+
+  failDailyUsage(accountId, usageDate, capturedAt) {
+    this.db.prepare(`
+      UPDATE daily_usage_snapshots
+      SET capture_succeeded = 0, calculation_status = 'capture_failed', captured_at = ?
+      WHERE account_id = ? AND usage_date = ? AND calculation_status = 'pending'
+    `).run(capturedAt, accountId, usageDate);
+    return this.readDailyUsage(accountId, usageDate);
+  }
+
+  failPendingDailyUsage(capturedAt) {
+    return this.db.prepare(`
+      UPDATE daily_usage_snapshots
+      SET calculation_status = 'capture_failed', captured_at = COALESCE(captured_at, ?)
+      WHERE calculation_status = 'pending'
+    `).run(capturedAt).changes;
   }
 
   readLeaderboardSnapshot() {
@@ -518,8 +639,14 @@ function makeUnavailableUsage(account, attemptedAt, refreshSeconds) {
   };
 }
 
-function toPrivateAccount(usage, account) {
-  return { ...usage, leaderboardEnabled: Boolean(account.leaderboard_enabled) };
+function toPrivateAccount(usage, account, dailyUsage) {
+  const yesterdayUsed = Number.isFinite(dailyUsage?.daily_used) ? Number(dailyUsage.daily_used) : null;
+  return {
+    ...usage,
+    leaderboardEnabled: Boolean(account.leaderboard_enabled),
+    yesterdayUsed,
+    yesterdayUsageStatus: dailyUsage?.calculation_status || 'missing'
+  };
 }
 
 function readStaticFile(name) {
@@ -619,21 +746,30 @@ export function createPackyApp({
   packyOrigin = DEFAULT_ORIGIN,
   usageProvider,
   leaderboardRequestSpacingMs = 1_000,
+  dailyRequestSpacingMs = leaderboardRequestSpacingMs,
   sessionTtlSeconds = DEFAULT_SESSION_TTL_SECONDS,
   nowMs = () => Date.now(),
+  scheduleTimeout = setTimeout,
+  cancelTimeout = clearTimeout,
   staticFiles
 }) {
   const effectiveRefreshSeconds = Math.max(DEFAULT_REFRESH_SECONDS, Number(refreshSeconds) || DEFAULT_REFRESH_SECONDS);
   const effectiveLeaderboardSpacingMs = Math.max(0, Number(leaderboardRequestSpacingMs) || 0);
+  const effectiveDailySpacingMs = Math.max(0, Number(dailyRequestSpacingMs) || 0);
   const effectiveSessionTtlSeconds = Math.max(effectiveRefreshSeconds, Number(sessionTtlSeconds) || DEFAULT_SESSION_TTL_SECONDS);
   const origin = usageProvider ? packyOrigin : validatePackyOrigin(packyOrigin);
   const queryUsage = usageProvider || ((key) => queryPackyUsage(key, origin));
   const store = new AccountStore(databasePath, masterKey);
+  store.failPendingDailyUsage(Math.floor(nowMs() / 1000));
   const isTrustedProxy = createTrustedProxyMatcher(trustedProxyCidrs);
   const limiter = createFailureLimiter({ nowMs });
   const cache = new Map();
   const inFlight = new Map();
   let leaderboardInFlight = null;
+  let dailyCaptureInFlight = null;
+  let dailyTimer = null;
+  let dailySchedulerStarted = false;
+  let dailySchedulerClosed = false;
   const assets = staticFiles || {
     my: readStaticFile('packy-my-usage.html'),
     leaderboard: readStaticFile('packy-key-usage.html'),
@@ -651,10 +787,10 @@ export function createPackyApp({
     return usage;
   }
 
-  async function getAccountUsage(account) {
+  async function getAccountUsage(account, { force = false } = {}) {
     const current = cache.get(account.id);
     const now = nowMs();
-    if (current && now - current.lastAttemptMs < effectiveRefreshSeconds * 1000) {
+    if (!force && current && now - current.lastAttemptMs < effectiveRefreshSeconds * 1000) {
       return current.result;
     }
     if (inFlight.has(account.id)) return inFlight.get(account.id);
@@ -691,8 +827,12 @@ export function createPackyApp({
 
   async function getPrivatePayload(session) {
     const accounts = store.listBySession(session.id);
-    const usage = await Promise.all(accounts.map(async (account) => toPrivateAccount(await getAccountUsage(account), account)));
     const now = Math.floor(nowMs() / 1000);
+    const yesterday = shiftDateKey(shanghaiDateKey(now), -1);
+    const usage = await Promise.all(accounts.map(async (account) => {
+      const dailyUsage = store.readDailyUsage(account.id, yesterday);
+      return toPrivateAccount(await getAccountUsage(account), account, dailyUsage);
+    }));
     return {
       generatedAt: now,
       refreshIntervalSeconds: effectiveRefreshSeconds,
@@ -777,6 +917,76 @@ export function createPackyApp({
 
   function invalidateLeaderboard(now) {
     store.invalidateLeaderboardSnapshot(now);
+  }
+
+  async function refreshDailyUsage({ usageDate, scheduledAt, delayed }) {
+    const accounts = store.listAll();
+    let attempted = 0;
+    for (const account of accounts) {
+      if (!store.claimDailyUsage(account.id, usageDate, scheduledAt, delayed)) continue;
+      if (attempted > 0 && effectiveDailySpacingMs > 0) {
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, effectiveDailySpacingMs));
+      }
+      attempted += 1;
+      const usage = await getAccountUsage(account, { force: true });
+      const capturedAt = Math.floor(nowMs() / 1000);
+      if (usage.status === 'ok') {
+        store.completeDailyUsage(account.id, usageDate, {
+          cumulativeUsed: usage.used,
+          quotaPeriodStart: usage.quotaPeriodStart,
+          capturedAt
+        });
+      } else {
+        store.failDailyUsage(account.id, usageDate, capturedAt);
+      }
+    }
+    return { usageDate, scheduledAt, attempted };
+  }
+
+  function runDailyCapture(options = {}) {
+    if (dailyCaptureInFlight) return dailyCaptureInFlight;
+    const now = Math.floor(nowMs() / 1000);
+    const usageDate = options.usageDate || shanghaiDateKey(now);
+    const scheduledAt = Number(options.scheduledAt || dailyCaptureAt(usageDate));
+    const delayed = options.delayed === undefined ? now > scheduledAt : Boolean(options.delayed);
+    dailyCaptureInFlight = refreshDailyUsage({ usageDate, scheduledAt, delayed }).finally(() => {
+      dailyCaptureInFlight = null;
+    });
+    return dailyCaptureInFlight;
+  }
+
+  function scheduleNextDailyCapture() {
+    if (dailySchedulerClosed) return;
+    const now = Math.floor(nowMs() / 1000);
+    const scheduledAt = nextDailyCaptureAt(now);
+    const usageDate = shanghaiDateKey(scheduledAt);
+    const delayMs = Math.max(0, scheduledAt * 1000 - nowMs());
+    dailyTimer = scheduleTimeout(async () => {
+      dailyTimer = null;
+      try {
+        await runDailyCapture({ usageDate, scheduledAt, delayed: false });
+      } catch (error) {
+        console.error(`Daily usage capture failed: ${error.message}`);
+      } finally {
+        scheduleNextDailyCapture();
+      }
+    }, delayMs);
+    dailyTimer?.unref?.();
+  }
+
+  function startDailyScheduler() {
+    if (dailySchedulerStarted) return dailyCaptureInFlight || Promise.resolve();
+    dailySchedulerStarted = true;
+    dailySchedulerClosed = false;
+    const now = Math.floor(nowMs() / 1000);
+    const usageDate = shanghaiDateKey(now);
+    const scheduledAt = dailyCaptureAt(usageDate);
+    if (now >= scheduledAt) {
+      const immediate = runDailyCapture({ usageDate, scheduledAt, delayed: now > scheduledAt });
+      return immediate.finally(scheduleNextDailyCapture);
+    }
+    scheduleNextDailyCapture();
+    return Promise.resolve();
   }
 
   async function handler(request, response) {
@@ -903,7 +1113,16 @@ export function createPackyApp({
     handler,
     store,
     cache,
-    close() { store.close(); }
+    runDailyCapture,
+    startDailyScheduler,
+    async close() {
+      dailySchedulerClosed = true;
+      if (dailyTimer !== null) cancelTimeout(dailyTimer);
+      if (dailyCaptureInFlight) {
+        try { await dailyCaptureInFlight; } catch { }
+      }
+      store.close();
+    }
   };
 }
 
@@ -947,6 +1166,7 @@ export async function startServer({ argv = process.argv.slice(2), env = process.
     server.once('error', reject);
     server.listen(port, host, resolveListen);
   });
+  app.startDailyScheduler().catch((error) => console.error(`Daily usage capture failed: ${error.message}`));
   const url = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}/my`;
   console.log(`PackyAPI usage service: ${url}`);
   console.log(`Database: ${databasePath}`);
@@ -954,8 +1174,8 @@ export async function startServer({ argv = process.argv.slice(2), env = process.
   if (!args.noOpen) openBrowser(url);
 
   const shutdown = () => {
-    server.close(() => {
-      app.close();
+    server.close(async () => {
+      await app.close();
       process.exit(0);
     });
   };

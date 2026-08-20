@@ -63,7 +63,7 @@ h3 { overflow-wrap:anywhere; }
 .account-state::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }
 .account-state.is-stale { color:var(--orange); }
 .account-state.is-error { color:var(--red); }
-.account-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:16px; }
+.account-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:16px; }
 .metric { min-width:0; padding-top:12px; border-top:1px solid var(--border); }
 .metric-label { color:var(--muted); }
 .metric-value { margin-top:4px; font-size:20px; font-weight:500; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
@@ -158,7 +158,6 @@ h3 { overflow-wrap:anywhere; }
   .key-form .button-primary { width:100%; }
   .account-card { padding:13px; }
   .account-metrics { grid-template-columns:1fr 1fr; gap:10px; }
-  .account-metrics .metric:last-child { grid-column:1 / -1; }
   .metric-value { font-size:18px; }
   .account-actions { align-items:flex-start; flex-direction:column; }
   .account-actions .button { width:100%; }

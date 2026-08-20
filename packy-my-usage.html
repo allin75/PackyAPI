@@ -86,6 +86,7 @@
             <div class="account-top"><div class="account-title"><h3>${escapeHtml(account.name)}</h3><div class="exact-summary"><strong>${escapeHtml(summary)}</strong></div><span class="account-state ${status.className}">${status.label}</span></div></div>
             <div class="account-metrics">
               <div class="metric"><div class="metric-label">已用金额</div><div class="metric-value">${available ? money.format(Number(account.used)) : "—"}</div></div>
+              <div class="metric"><div class="metric-label">昨日用量</div><div class="metric-value">${Number.isFinite(account.yesterdayUsed) ? money.format(Number(account.yesterdayUsed)) : "—"}</div></div>
               <div class="metric"><div class="metric-label">剩余额度</div><div class="metric-value">${available ? money.format(Number(account.remaining)) : "—"}</div></div>
               <div class="metric"><div class="metric-label">总额度</div><div class="metric-value">${available ? money.format(Number(account.total)) : "—"}</div></div>
             </div>
