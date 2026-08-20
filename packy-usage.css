@@ -107,7 +107,8 @@ h3 { overflow-wrap:anywhere; }
 .podium-number { color:var(--race-text); font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; letter-spacing:-.04em; }
 .podium-avatar { position:relative; z-index:1; width:62px; height:62px; display:grid; place-items:center; margin-top:12px; border:1px solid var(--race-line); border-radius:50%; background:var(--race-bg); color:var(--race-text); font-size:25px; font-weight:700; box-shadow:inset 0 0 0 5px color-mix(in srgb,var(--race-panel-strong) 75%,transparent); }
 .podium-rank-1 .podium-avatar { width:72px; height:72px; border-color:color-mix(in srgb,var(--gold) 65%,var(--race-line)); }
-.podium-name { position:relative; z-index:1; width:100%; margin-top:13px; overflow:hidden; color:var(--race-text); font-size:15px; font-weight:600; text-align:center; text-overflow:ellipsis; white-space:nowrap; }
+.podium-name { position:relative; z-index:1; width:100%; min-width:0; display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:6px; margin-top:13px; color:var(--race-text); font-size:15px; font-weight:600; text-align:center; }
+.podium-name-text { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .podium-meta { position:relative; z-index:1; display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:9px; margin-top:10px; }
 .podium-amount { color:var(--race-text); font-size:19px; font-weight:700; font-variant-numeric:tabular-nums; letter-spacing:-.02em; white-space:nowrap; }
 .movement { min-width:40px; display:inline-flex; align-items:center; justify-content:center; padding:3px 7px; border:1px solid transparent; border-radius:4px; font-size:11px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.2; white-space:nowrap; }
@@ -115,6 +116,7 @@ h3 { overflow-wrap:anywhere; }
 .movement-down { border-color:color-mix(in srgb,var(--race-red) 36%,transparent); background:color-mix(in srgb,var(--race-red) 12%,transparent); color:var(--race-red); }
 .movement-new { border-color:color-mix(in srgb,var(--race-new) 38%,transparent); background:color-mix(in srgb,var(--race-new) 12%,transparent); color:var(--race-new); letter-spacing:.05em; }
 .movement-same { color:var(--race-muted); }
+.stale-badge { flex:none; display:inline-flex; align-items:center; min-height:20px; padding:2px 6px; border:1px solid color-mix(in srgb,var(--orange) 45%,transparent); border-radius:4px; background:color-mix(in srgb,var(--orange) 12%,transparent); color:var(--orange); font-size:10px; font-weight:700; line-height:1; white-space:nowrap; }
 .table-wrap { overflow-x:auto; }
 .standings-wrap { border-top:1px solid var(--race-line); }
 .standings-heading { min-height:42px; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:0 18px; border-bottom:1px solid var(--race-line); color:var(--race-text); font-size:12px; font-weight:600; letter-spacing:.04em; }
@@ -129,7 +131,8 @@ h3 { overflow-wrap:anywhere; }
 .movement-column { width:104px; text-align:center !important; }
 .amount-column { width:190px; text-align:right !important; }
 .rank-number { color:var(--race-muted); font-size:13px; font-weight:700; font-variant-numeric:tabular-nums; }
-.leader-name { overflow:hidden; color:var(--race-text); font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+.leader-name { min-width:0; display:flex; align-items:center; gap:7px; color:var(--race-text); font-weight:600; }
+.leader-name-text { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .amount { color:var(--race-text); font-size:16px; font-weight:700; font-variant-numeric:tabular-nums; white-space:nowrap; }
 @keyframes standings-enter { from { opacity:0; translate:0 8px; } to { opacity:1; translate:0 0; } }
 @media (max-width:760px) {

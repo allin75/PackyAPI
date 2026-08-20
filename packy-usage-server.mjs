@@ -15,6 +15,11 @@ const JSON_BODY_LIMIT = 8 * 1024;
 const SESSION_COOKIE_NAME = '__Host-packy_session';
 const DEFAULT_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_REFRESH_SECONDS = 5 * 60;
+const HOUR_SECONDS = 60 * 60;
+
+export function nextHourlyRefreshAt(now) {
+  return (Math.floor(Number(now) / HOUR_SECONDS) + 1) * HOUR_SECONDS;
+}
 
 class PublicError extends Error {
   constructor(statusCode, message, headers = {}) {
@@ -345,7 +350,8 @@ export class AccountStore {
     try {
       this.db.exec('DELETE FROM leaderboard_snapshots');
       for (const entry of entries) {
-        insert.run(entry.accountId, entry.name, entry.used, entry.rank, entry.rankChange, generatedAt);
+        const observedAt = Number.isFinite(entry.observedAt) ? entry.observedAt : generatedAt;
+        insert.run(entry.accountId, entry.name, entry.used, entry.rank, entry.rankChange, observedAt);
       }
       this.db.prepare(`
         INSERT INTO leaderboard_snapshot_meta (id, generated_at, next_refresh_at)
@@ -613,14 +619,12 @@ export function createPackyApp({
   packyOrigin = DEFAULT_ORIGIN,
   usageProvider,
   leaderboardRequestSpacingMs = 1_000,
-  leaderboardRetrySeconds = 600,
   sessionTtlSeconds = DEFAULT_SESSION_TTL_SECONDS,
   nowMs = () => Date.now(),
   staticFiles
 }) {
   const effectiveRefreshSeconds = Math.max(DEFAULT_REFRESH_SECONDS, Number(refreshSeconds) || DEFAULT_REFRESH_SECONDS);
   const effectiveLeaderboardSpacingMs = Math.max(0, Number(leaderboardRequestSpacingMs) || 0);
-  const effectiveLeaderboardRetrySeconds = Math.max(effectiveRefreshSeconds, Number(leaderboardRetrySeconds) || 600);
   const effectiveSessionTtlSeconds = Math.max(effectiveRefreshSeconds, Number(sessionTtlSeconds) || DEFAULT_SESSION_TTL_SECONDS);
   const origin = usageProvider ? packyOrigin : validatePackyOrigin(packyOrigin);
   const queryUsage = usageProvider || ((key) => queryPackyUsage(key, origin));
@@ -630,7 +634,6 @@ export function createPackyApp({
   const cache = new Map();
   const inFlight = new Map();
   let leaderboardInFlight = null;
-  let leaderboardRetry = null;
   const assets = staticFiles || {
     my: readStaticFile('packy-my-usage.html'),
     leaderboard: readStaticFile('packy-key-usage.html'),
@@ -710,64 +713,40 @@ export function createPackyApp({
           used: Number.isFinite(entry.used) ? Number(entry.used) : null,
           rank: Number(entry.rank),
           rankChange,
-          movement: rankChange === null ? 'new' : (rankChange > 0 ? 'up' : (rankChange < 0 ? 'down' : 'same'))
+          movement: rankChange === null ? 'new' : (rankChange > 0 ? 'up' : (rankChange < 0 ? 'down' : 'same')),
+          stale: Number(entry.observed_at) < Number(snapshot.meta.generated_at)
         };
       }),
       ...overrides
     };
   }
 
-  function mergePendingLeaderboardAccounts(snapshot, accounts, observedAt) {
-    const activeAccountIds = new Set(accounts.map((account) => String(account.id)));
-    const rows = snapshot.rows.filter((entry) => activeAccountIds.has(String(entry.account_id)));
-    const snapshotAccountIds = new Set(rows.map((entry) => String(entry.account_id)));
-    let nextRank = rows.reduce((maximum, entry) => Math.max(maximum, Number(entry.rank)), 0) + 1;
-    for (const account of accounts) {
-      if (snapshotAccountIds.has(String(account.id))) continue;
-      rows.push({
-        account_id: String(account.id),
-        name: String(account.name),
-        used: null,
-        rank: nextRank,
-        rank_delta: null,
-        observed_at: observedAt
-      });
-      nextRank += 1;
-    }
-    return { meta: snapshot.meta, rows };
-  }
-
   async function refreshLeaderboardSnapshot(previous, now) {
     const accounts = store.listLeaderboard();
-    const usage = [];
+    const previousRows = new Map(previous.rows.map((entry) => [String(entry.account_id), entry]));
+    const entries = [];
     for (let index = 0; index < accounts.length; index += 1) {
       if (index > 0 && effectiveLeaderboardSpacingMs > 0) {
         await new Promise((resolveDelay) => setTimeout(resolveDelay, effectiveLeaderboardSpacingMs));
       }
       const account = accounts[index];
       const item = await getAccountUsage(account);
-      usage.push({ account, usage: item });
-      if (previous.meta && item.status !== 'ok') break;
-    }
-    if (previous.meta && usage.some((item) => item.usage.status !== 'ok')) {
-      const retryAt = now + effectiveLeaderboardRetrySeconds;
-      const fallback = mergePendingLeaderboardAccounts(previous, accounts, now);
-      const payload = publicLeaderboardPayload(fallback, {
-        nextRefreshAt: retryAt,
-        stale: true,
-        message: '上游限流，已保留上次有效数据并延迟重试。'
+      const previousRow = previousRows.get(String(account.id));
+      entries.push(item.status === 'ok' ? {
+        accountId: String(account.id),
+        name: item.name,
+        used: Number.isFinite(item.used) ? item.used : null,
+        observedAt: now
+      } : {
+        accountId: String(account.id),
+        name: previousRow ? String(previousRow.name) : String(account.name),
+        used: Number.isFinite(previousRow?.used) ? Number(previousRow.used) : null,
+        observedAt: previousRow ? Number(previousRow.observed_at) : 0
       });
-      leaderboardRetry = { untilMs: retryAt * 1000, payload };
-      return payload;
     }
 
     const previousRanks = new Map(previous.rows.map((entry) => [String(entry.account_id), Number(entry.rank)]));
-    const entries = usage
-      .map(({ account, usage: item }) => ({
-        accountId: String(account.id),
-        name: item.name,
-        used: Number.isFinite(item.used) ? item.used : null
-      }))
+    const rankedEntries = entries
       .sort((left, right) => {
         if (left.used === null && right.used !== null) return 1;
         if (right.used === null && left.used !== null) return -1;
@@ -780,15 +759,12 @@ export function createPackyApp({
         const previousRank = previousRanks.get(entry.accountId);
         return { ...entry, rank, rankChange: previousRank === undefined ? null : previousRank - rank };
       });
-    const nextRefreshAt = now + effectiveRefreshSeconds;
-    store.saveLeaderboardSnapshot(entries, now, nextRefreshAt);
-    leaderboardRetry = null;
+    store.saveLeaderboardSnapshot(rankedEntries, now, nextHourlyRefreshAt(now));
     return publicLeaderboardPayload(store.readLeaderboardSnapshot());
   }
 
   async function getLeaderboardPayload() {
     const nowMilliseconds = nowMs();
-    if (leaderboardRetry && nowMilliseconds < leaderboardRetry.untilMs) return leaderboardRetry.payload;
     const now = Math.floor(nowMilliseconds / 1000);
     const snapshot = store.readLeaderboardSnapshot();
     if (snapshot.meta && Number(snapshot.meta.next_refresh_at) > now) return publicLeaderboardPayload(snapshot);
@@ -801,7 +777,6 @@ export function createPackyApp({
 
   function invalidateLeaderboard(now) {
     store.invalidateLeaderboardSnapshot(now);
-    leaderboardRetry = null;
   }
 
   async function handler(request, response) {

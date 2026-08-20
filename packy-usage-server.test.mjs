@@ -9,6 +9,7 @@ import {
   AccountStore,
   createPackyApp,
   createTrustedProxyMatcher,
+  nextHourlyRefreshAt,
   normalizeIp,
   resolveRequestIdentity
 } from './packy-usage-server.mjs';
@@ -121,6 +122,12 @@ test('normalizes IPs and trusts forwarding headers only from configured proxies'
   assert.equal(proxied.secure, true);
 });
 
+test('aligns leaderboard refreshes to the next natural hour', () => {
+  assert.equal(nextHourlyRefreshAt(1_800_000_000), 1_800_003_600);
+  assert.equal(nextHourlyRefreshAt(1_800_000_123), 1_800_003_600);
+  assert.equal(nextHourlyRefreshAt(1_800_003_600), 1_800_007_200);
+});
+
 test('migrates a version 1 database to version 3 without losing accounts', () => {
   const directory = mkdtempSync(join(tmpdir(), 'packy-usage-migration-'));
   const databasePath = join(directory, 'usage.sqlite');
@@ -210,10 +217,10 @@ test('supports multiple IPs and keys while keeping the public response minimal',
 
   const leaderboard = await fixture.request('198.51.100.1', '/api/leaderboard');
   assert.deepEqual(leaderboard.body.accounts, [
-    { name: 'software-codex-B', used: 60, rank: 1, rankChange: null, movement: 'new' },
-    { name: 'software-codex-A', used: 20, rank: 2, rankChange: null, movement: 'new' }
+    { name: 'software-codex-B', used: 60, rank: 1, rankChange: null, movement: 'new', stale: false },
+    { name: 'software-codex-A', used: 20, rank: 2, rankChange: null, movement: 'new', stale: false }
   ]);
-  assert.deepEqual(Object.keys(leaderboard.body.accounts[0]).sort(), ['movement', 'name', 'rank', 'rankChange', 'used']);
+  assert.deepEqual(Object.keys(leaderboard.body.accounts[0]).sort(), ['movement', 'name', 'rank', 'rankChange', 'stale', 'used']);
   assert.ok(!JSON.stringify(leaderboard.body).includes(accountA));
   assert.ok(!JSON.stringify(leaderboard.body).includes('remaining'));
 
@@ -258,6 +265,7 @@ test('persists leaderboard movement across refresh windows and restarts', async 
   }
 
   const first = await fixture.request('198.51.100.1', '/api/leaderboard');
+  assert.equal(first.body.nextRefreshAt, 1_800_003_600);
   assert.deepEqual(first.body.accounts.map(({ name, rank, rankChange, movement }) => ({ name, rank, rankChange, movement })), [
     { name: 'Apex', rank: 1, rankChange: null, movement: 'new' },
     { name: 'Blaze', rank: 2, rankChange: null, movement: 'new' },
@@ -277,9 +285,14 @@ test('persists leaderboard movement across refresh windows and restarts', async 
 
   phase = 2;
   fixture.advance(300_001);
+  const beforeHour = await fixture.request('198.51.100.4', '/api/leaderboard');
+  assert.deepEqual(beforeHour.body, first.body);
+  assert.equal(calls, 3);
+
+  fixture.advance(3_300_000);
   const [refreshed, concurrent] = await Promise.all([
-    fixture.request('198.51.100.4', '/api/leaderboard'),
-    fixture.request('198.51.100.5', '/api/leaderboard')
+    fixture.request('198.51.100.5', '/api/leaderboard'),
+    fixture.request('198.51.100.6', '/api/leaderboard')
   ]);
   assert.deepEqual(concurrent.body, refreshed.body);
   assert.ok(refreshed.body.generatedAt > generatedAt);
@@ -289,49 +302,115 @@ test('persists leaderboard movement across refresh windows and restarts', async 
     { name: 'Blaze', rank: 3, rankChange: -1, movement: 'down' }
   ]);
   assert.equal(calls, 6);
+  assert.equal(refreshed.body.nextRefreshAt, 1_800_007_200);
 
-  fixture.advance(300_001);
-  const unchanged = await fixture.request('198.51.100.6', '/api/leaderboard');
+  fixture.advance(3_600_001);
+  const unchanged = await fixture.request('198.51.100.7', '/api/leaderboard');
   assert.ok(unchanged.body.accounts.every((account) => account.rankChange === 0 && account.movement === 'same'));
   assert.equal(calls, 9);
   assert.deepEqual(accounts.length, 3);
 });
 
-test('keeps the previous leaderboard snapshot when a refresh fails', async (t) => {
-  let fail = false;
+test('continues an hourly leaderboard refresh when one account fails', async (t) => {
+  let phase = 1;
   let calls = 0;
   const provider = async (key) => {
     calls += 1;
-    if (fail) throw new Error('temporary outage');
+    if (phase === 2 && key === KEY_B) throw new Error('temporary outage');
+    const values = phase === 1
+      ? new Map([[KEY_A, ['Alpha', 100]], [KEY_B, ['Bravo', 80]], [KEY_C, ['Charlie', 60]]])
+      : new Map([[KEY_A, ['Alpha', 110]], [KEY_C, ['Charlie', 130]]]);
+    const [name, used] = values.get(key);
+    return packyData(name, used, 100);
+  };
+  const fixture = await createFixture({ provider });
+  t.after(() => fixture.close());
+
+  for (const [index, key] of [KEY_A, KEY_B, KEY_C].entries()) {
+    const ip = `203.0.113.${70 + index}`;
+    const registered = await fixture.request(ip, '/api/accounts/register', { method: 'POST', body: { key } });
+    await fixture.request(ip, `/api/me/accounts/${registered.body.account.id}/leaderboard`, { method: 'PATCH', body: { enabled: true } });
+  }
+  const first = await fixture.request('198.51.100.8', '/api/leaderboard');
+  assert.equal(calls, 3);
+
+  phase = 2;
+  await fixture.restart();
+  fixture.advance(3_600_001);
+  const refreshed = await fixture.request('198.51.100.9', '/api/leaderboard');
+
+  assert.ok(refreshed.body.generatedAt > first.body.generatedAt);
+  assert.equal(refreshed.body.nextRefreshAt, 1_800_007_200);
+  assert.equal(calls, 6);
+  assert.deepEqual(refreshed.body.accounts, [
+    { name: 'Charlie', used: 130, rank: 1, rankChange: 2, movement: 'up', stale: false },
+    { name: 'Alpha', used: 110, rank: 2, rankChange: -1, movement: 'down', stale: false },
+    { name: 'Bravo', used: 80, rank: 3, rankChange: -1, movement: 'down', stale: true }
+  ]);
+
+  const repeated = await fixture.request('198.51.100.10', '/api/leaderboard');
+  assert.deepEqual(repeated.body, refreshed.body);
+  assert.equal(calls, 6);
+
+  await fixture.restart();
+  const restored = await fixture.request('198.51.100.11', '/api/leaderboard');
+  assert.deepEqual(restored.body, refreshed.body);
+  assert.equal(calls, 6);
+});
+
+test('keeps a newly joined account visible when its first leaderboard refresh fails', async (t) => {
+  let failNewcomer = false;
+  const provider = async (key) => {
+    if (failNewcomer && key === KEY_B) throw new Error('temporary outage');
     return key === KEY_A ? packyData('Reliable', 42, 100) : packyData('Newcomer', 18, 100);
   };
   const fixture = await createFixture({ provider });
   t.after(() => fixture.close());
 
-  const registered = await fixture.request('203.0.113.70', '/api/accounts/register', { method: 'POST', body: { key: KEY_A } });
-  await fixture.request('203.0.113.70', `/api/me/accounts/${registered.body.account.id}/leaderboard`, { method: 'PATCH', body: { enabled: true } });
-  const first = await fixture.request('198.51.100.7', '/api/leaderboard');
+  const reliable = await fixture.request('203.0.113.74', '/api/accounts/register', { method: 'POST', body: { key: KEY_A } });
+  await fixture.request('203.0.113.74', `/api/me/accounts/${reliable.body.account.id}/leaderboard`, { method: 'PATCH', body: { enabled: true } });
+  await fixture.request('198.51.100.12', '/api/leaderboard');
 
-  const newcomer = await fixture.request('203.0.113.71', '/api/accounts/register', { method: 'POST', body: { key: KEY_B } });
-  await fixture.request('203.0.113.71', `/api/me/accounts/${newcomer.body.account.id}/leaderboard`, { method: 'PATCH', body: { enabled: true } });
+  const newcomer = await fixture.request('203.0.113.75', '/api/accounts/register', { method: 'POST', body: { key: KEY_B } });
+  await fixture.request('203.0.113.75', `/api/me/accounts/${newcomer.body.account.id}/leaderboard`, { method: 'PATCH', body: { enabled: true } });
 
   await fixture.restart();
-  fail = true;
-  fixture.advance(300_001);
-  const stale = await fixture.request('198.51.100.8', '/api/leaderboard');
-  assert.equal(stale.body.stale, true);
-  assert.equal(stale.body.generatedAt, first.body.generatedAt);
-  assert.deepEqual(stale.body.accounts, [
-    ...first.body.accounts,
-    { name: 'Newcomer', used: null, rank: 2, rankChange: null, movement: 'new' }
+  failNewcomer = true;
+  const refreshed = await fixture.request('198.51.100.13', '/api/leaderboard');
+  assert.deepEqual(refreshed.body.accounts, [
+    { name: 'Reliable', used: 42, rank: 1, rankChange: 0, movement: 'same', stale: false },
+    { name: 'Newcomer', used: null, rank: 2, rankChange: null, movement: 'new', stale: true }
   ]);
-  assert.equal(calls, 3);
-  assert.equal(stale.body.nextRefreshAt, Math.floor((1_800_000_000_000 + 300_001) / 1000) + 600);
+});
 
-  fixture.advance(300_001);
-  const repeated = await fixture.request('198.51.100.9', '/api/leaderboard');
-  assert.deepEqual(repeated.body, stale.body);
-  assert.equal(calls, 3);
+test('saves a new hourly snapshot when every leaderboard account fails', async (t) => {
+  let fail = false;
+  const provider = async (key) => {
+    if (fail) throw new Error('temporary outage');
+    return key === KEY_A ? packyData('Alpha', 30, 100) : packyData('Bravo', 20, 100);
+  };
+  const fixture = await createFixture({ provider });
+  t.after(() => fixture.close());
+
+  for (const [index, key] of [KEY_A, KEY_B].entries()) {
+    const ip = `203.0.113.${76 + index}`;
+    const registered = await fixture.request(ip, '/api/accounts/register', { method: 'POST', body: { key } });
+    await fixture.request(ip, `/api/me/accounts/${registered.body.account.id}/leaderboard`, { method: 'PATCH', body: { enabled: true } });
+  }
+  const first = await fixture.request('198.51.100.14', '/api/leaderboard');
+
+  fail = true;
+  await fixture.restart();
+  fixture.advance(3_600_001);
+  const refreshed = await fixture.request('198.51.100.15', '/api/leaderboard');
+
+  assert.ok(refreshed.body.generatedAt > first.body.generatedAt);
+  assert.equal(refreshed.body.nextRefreshAt, 1_800_007_200);
+  assert.ok(refreshed.body.accounts.every((account) => account.stale));
+  assert.deepEqual(refreshed.body.accounts.map(({ name, used }) => ({ name, used })), [
+    { name: 'Alpha', used: 30 },
+    { name: 'Bravo', used: 20 }
+  ]);
 });
 
 test('refreshes leaderboard accounts sequentially to avoid upstream bursts', async (t) => {
@@ -359,16 +438,19 @@ test('refreshes leaderboard accounts sequentially to avoid upstream bursts', asy
   await fixture.request('198.51.100.20', '/api/leaderboard');
 
   trackConcurrency = true;
-  fixture.advance(300_001);
+  fixture.advance(3_600_001);
   const refreshed = await fixture.request('198.51.100.21', '/api/leaderboard');
   assert.equal(refreshed.status, 200);
   assert.equal(maximumActiveCalls, 1);
 });
 
-test('shows stale leaderboard data as a quiet retry state instead of an error banner', () => {
+test('labels hourly and per-account stale leaderboard data', () => {
   const html = readFileSync(new URL('./packy-key-usage.html', import.meta.url), 'utf8');
-  assert.match(html, /上次有效数据/);
-  assert.doesNotMatch(html, /if \(payload\.stale\) showError/);
+  assert.match(html, /整点刷新/);
+  assert.match(html, /沿用上轮/);
+  assert.match(html, /account\.stale/);
+  assert.doesNotMatch(html, /5 分钟刷新/);
+  assert.doesNotMatch(html, /已自动延迟重试/);
 });
 
 test('uses the simplified packycode brand and session wording', () => {
@@ -377,8 +459,7 @@ test('uses the simplified packycode brand and session wording', () => {
   assert.match(myHtml, /packycode用量查询/);
   assert.match(leaderboardHtml, /packycode用量查询/);
   assert.match(myHtml, />05:00<|refreshSeconds: 300/);
-  assert.match(leaderboardHtml, />05:00<|refreshSeconds:300/);
-  assert.match(leaderboardHtml, /5 分钟刷新/);
+  assert.match(leaderboardHtml, /整点刷新/);
   assert.match(leaderboardHtml, /chars\[chars\.length - 1\]/);
   assert.match(myHtml, /packy-leaderboard-refresh/);
   assert.match(leaderboardHtml, /addEventListener\("storage"/);

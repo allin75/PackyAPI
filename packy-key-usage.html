@@ -22,13 +22,13 @@
   <main class="page">
     <div class="page-heading">
       <div><h1>账号消耗排行</h1><div class="subtitle" id="updatedLabel" aria-live="polite">正在读取排行数据</div></div>
-      <div class="countdown">下次更新 <strong id="countdown">05:00</strong></div>
+      <div class="countdown">下次更新 <strong id="countdown">--:--</strong></div>
     </div>
     <div class="error-banner" id="errorBanner" role="alert"><i data-lucide="circle-alert" aria-hidden="true"></i><span id="errorText"></span></div>
     <section class="leaderboard-shell" aria-labelledby="leaderboardTitle">
       <div class="leaderboard-header">
         <div><span class="leaderboard-kicker">RACE CONTROL · LIVE STANDINGS</span><h2 class="leaderboard-title" id="leaderboardTitle"><i data-lucide="trophy" aria-hidden="true"></i>赛事排行榜</h2></div>
-        <span class="cache-label">5 分钟刷新 · 较上轮排名</span>
+        <span class="cache-label">整点刷新 · 较上轮排名</span>
       </div>
       <div class="loading-state" id="loadingState"><div class="state-stack"><i data-lucide="loader-circle" aria-hidden="true"></i><span>正在同步用量</span></div></div>
       <div class="empty-state" id="emptyState" hidden><div class="state-stack"><i data-lucide="list-ordered" aria-hidden="true"></i><span>暂时没有账号参与排行</span></div></div>
@@ -56,6 +56,7 @@
       function showError(message) { elements.errorText.textContent = message; elements.errorBanner.classList.add("is-visible"); }
       function clearError() { elements.errorText.textContent = ""; elements.errorBanner.classList.remove("is-visible"); }
       function initial(name) { const chars = Array.from(String(name || "P").trim()); return chars[chars.length - 1]?.toUpperCase() || "P"; }
+      function staleBadge(account) { return account.stale ? `<span class="stale-badge">沿用上轮</span>` : ""; }
       function movementBadge(account) {
         const change = Number(account.rankChange);
         if (account.movement === "up") return `<span class="movement movement-up" aria-label="上升 ${Math.abs(change)} 名">↑ ${Math.abs(change)}</span>`;
@@ -66,7 +67,7 @@
       function renderPodium(account) {
         const rank = Number(account.rank);
         const place = rank === 1 ? "冠军" : (rank === 2 ? "亚军" : "季军");
-        return `<article class="podium-card podium-rank-${rank}" data-rank="${rank}"><div class="podium-position"><span class="podium-number">0${rank}</span><span>${place}</span></div><div class="podium-avatar" aria-hidden="true">${escapeHtml(initial(account.name))}</div><div class="podium-name">${escapeHtml(account.name)}</div><div class="podium-meta"><span class="podium-amount">${account.used === null ? "暂不可用" : money.format(Number(account.used))}</span>${movementBadge(account)}</div></article>`;
+        return `<article class="podium-card podium-rank-${rank}" data-rank="${rank}"><div class="podium-position"><span class="podium-number">0${rank}</span><span>${place}</span></div><div class="podium-avatar" aria-hidden="true">${escapeHtml(initial(account.name))}</div><div class="podium-name"><span class="podium-name-text">${escapeHtml(account.name)}</span>${staleBadge(account)}</div><div class="podium-meta"><span class="podium-amount">${account.used === null ? "暂不可用" : money.format(Number(account.used))}</span>${movementBadge(account)}</div></article>`;
       }
       function render() {
         elements.loadingState.hidden = true;
@@ -78,7 +79,7 @@
         elements.podiumGrid.dataset.count = String(podiumAccounts.length);
         elements.podiumGrid.innerHTML = podiumAccounts.map(renderPodium).join("");
         elements.tableWrap.hidden = remainingAccounts.length === 0;
-        elements.leaderboardBody.innerHTML = remainingAccounts.map((account,index) => { const rank = Number(account.rank || index + 4); return `<tr data-rank="${rank}"><td class="rank-column"><span class="rank-number">${String(rank).padStart(2,"0")}</span></td><td><div class="leader-name">${escapeHtml(account.name)}</div></td><td class="movement-column">${movementBadge(account)}</td><td class="amount-column"><span class="amount">${account.used === null ? "暂不可用" : money.format(Number(account.used))}</span></td></tr>`; }).join("");
+        elements.leaderboardBody.innerHTML = remainingAccounts.map((account,index) => { const rank = Number(account.rank || index + 4); return `<tr data-rank="${rank}"><td class="rank-column"><span class="rank-number">${String(rank).padStart(2,"0")}</span></td><td><div class="leader-name"><span class="leader-name-text">${escapeHtml(account.name)}</span>${staleBadge(account)}</div></td><td class="movement-column">${movementBadge(account)}</td><td class="amount-column"><span class="amount">${account.used === null ? "暂不可用" : money.format(Number(account.used))}</span></td></tr>`; }).join("");
       }
       async function loadLeaderboard() {
         if (state.loading) return;
@@ -90,7 +91,8 @@
           state.refreshSeconds = Math.max(300, Number(payload.refreshIntervalSeconds || 300));
           state.nextRefreshAt = Number(payload.nextRefreshAt || 0) * 1000 || Date.now() + state.refreshSeconds * 1000;
           const updatedAt = new Date(Number(payload.generatedAt) * 1000).toLocaleString("zh-CN", { hour12:false });
-          elements.updatedLabel.textContent = payload.stale ? `上次有效数据 ${updatedAt} · 已自动延迟重试` : `数据更新于 ${updatedAt} · 较上轮排名`;
+          const staleCount = state.accounts.filter((account) => account.stale).length;
+          elements.updatedLabel.textContent = staleCount ? `数据更新于 ${updatedAt} · ${staleCount} 个账号沿用上轮` : `数据更新于 ${updatedAt} · 较上轮排名`;
           render();
         } catch (error) { showError(error.message || "无法读取排行榜"); elements.updatedLabel.textContent = state.accounts.length ? elements.updatedLabel.textContent : "读取失败"; state.nextRefreshAt = Date.now() + state.refreshSeconds * 1000; }
         finally { state.loading = false; updateCountdown(); }
