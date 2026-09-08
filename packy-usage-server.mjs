@@ -221,7 +221,7 @@ export class AccountStore {
       PRAGMA busy_timeout = 5000;
     `);
     const schemaVersion = Number(this.db.prepare('PRAGMA user_version').get().user_version || 0);
-    if (schemaVersion > 4) throw new Error(`Database schema version ${schemaVersion} is newer than this application supports.`);
+    if (schemaVersion > 5) throw new Error(`Database schema version ${schemaVersion} is newer than this application supports.`);
     if (schemaVersion < 1) {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS accounts (
@@ -308,6 +308,20 @@ export class AccountStore {
         CREATE INDEX IF NOT EXISTS daily_usage_snapshots_date_idx
           ON daily_usage_snapshots(usage_date, account_id);
         PRAGMA user_version = 4;
+        COMMIT;
+      `);
+    }
+    if (schemaVersion < 5) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        CREATE TABLE IF NOT EXISTS today_leaderboard_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          usage_date TEXT NOT NULL,
+          generated_at INTEGER NOT NULL,
+          next_refresh_at INTEGER NOT NULL,
+          entries_json TEXT NOT NULL
+        );
+        PRAGMA user_version = 5;
         COMMIT;
       `);
     }
@@ -495,6 +509,20 @@ export class AccountStore {
     return { meta, rows };
   }
 
+  readTodayLeaderboard() {
+    const row = this.db.prepare('SELECT * FROM today_leaderboard_state WHERE id = 1').get();
+    return row ? { date: row.usage_date, generatedAt: row.generated_at, nextRefreshAt: row.next_refresh_at, accounts: JSON.parse(row.entries_json) } : null;
+  }
+
+  saveTodayLeaderboard(snapshot) {
+    this.db.prepare(`
+      INSERT INTO today_leaderboard_state (id, usage_date, generated_at, next_refresh_at, entries_json)
+      VALUES (1, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET usage_date=excluded.usage_date, generated_at=excluded.generated_at,
+        next_refresh_at=excluded.next_refresh_at, entries_json=excluded.entries_json
+    `).run(snapshot.date, snapshot.generatedAt, snapshot.nextRefreshAt, JSON.stringify(snapshot.accounts));
+  }
+
   saveLeaderboardSnapshot(entries, generatedAt, nextRefreshAt) {
     const insert = this.db.prepare(`
       INSERT INTO leaderboard_snapshots (account_id, name, used, rank, rank_delta, observed_at)
@@ -521,6 +549,7 @@ export class AccountStore {
 
   invalidateLeaderboardSnapshot(now) {
     this.db.prepare('UPDATE leaderboard_snapshot_meta SET next_refresh_at = ? WHERE id = 1').run(now);
+    this.db.prepare('UPDATE today_leaderboard_state SET next_refresh_at = ? WHERE id = 1').run(now);
   }
 
   createAccount({ key, name, origin, ip, now }) {
@@ -616,9 +645,9 @@ export async function queryPackyUsage(key, origin = DEFAULT_ORIGIN) {
   try {
     payload = JSON.parse(text);
   } catch {
-    throw new Error('PackyAPI returned an invalid response.');
+    throw Object.assign(new Error('PackyAPI returned an invalid response.'), { usageFailure:'invalid_json', upstreamStatus:response.status });
   }
-  if (!response.ok || !payload?.data) throw new Error('PackyAPI rejected the Key or is temporarily unavailable.');
+  if (!response.ok || !payload?.data) throw Object.assign(new Error('PackyAPI rejected the Key or is temporarily unavailable.'), { usageFailure:response.ok ? 'missing_data' : 'http_error', upstreamStatus:response.status });
   return payload.data;
 }
 
@@ -799,6 +828,8 @@ export function createPackyApp({
   const cache = new Map();
   const inFlight = new Map();
   let leaderboardInFlight = null;
+  let todayLeaderboardInFlight = null;
+  let leaderboardRevision = 0;
   let dailyCaptureInFlight = null;
   let dailyTimer = null;
   let dailySchedulerStarted = false;
@@ -833,7 +864,11 @@ export function createPackyApp({
         const key = store.decryptKey(account);
         const data = await queryUsage(key);
         return primeUsage(account, data, now);
-      } catch {
+      } catch (error) {
+        // Never log upstream bodies/messages, Keys, account IDs or balances.
+        const kind = ['invalid_json', 'missing_data', 'http_error'].includes(error?.usageFailure)
+          ? error.usageFailure : error?.name === 'TimeoutError' ? 'timeout' : 'query_failed';
+        console.warn(JSON.stringify({ event:'usage_query_failed', kind, httpStatus:Number(error?.upstreamStatus) || null, at:Math.floor(now / 1000) }));
         const attemptedAt = Math.floor(now / 1000);
         const stale = current?.result && current.result.status !== 'error'
           ? { ...current.result, status: 'stale', stale: true, nextRefreshAt: attemptedAt + effectiveRefreshSeconds }
@@ -875,11 +910,12 @@ export function createPackyApp({
   }
 
   function publicLeaderboardPayload(snapshot, overrides = {}) {
+    const optedIn = new Set(store.listLeaderboard().map(account => String(account.id)));
     return {
       generatedAt: Number(snapshot.meta.generated_at),
       refreshIntervalSeconds: effectiveRefreshSeconds,
       nextRefreshAt: Number(snapshot.meta.next_refresh_at),
-      accounts: snapshot.rows.map((entry) => {
+      accounts: snapshot.rows.filter(entry => optedIn.has(String(entry.account_id))).map((entry) => {
         const rankChange = entry.rank_delta === null ? null : Number(entry.rank_delta);
         return {
           name: String(entry.name),
@@ -895,6 +931,7 @@ export function createPackyApp({
   }
 
   async function refreshLeaderboardSnapshot(previous, now) {
+    const revision = leaderboardRevision;
     const accounts = store.listLeaderboard();
     const previousRows = new Map(previous.rows.map((entry) => [String(entry.account_id), entry]));
     const entries = [];
@@ -932,6 +969,7 @@ export function createPackyApp({
         const previousRank = previousRanks.get(entry.accountId);
         return { ...entry, rank, rankChange: previousRank === undefined ? null : previousRank - rank };
       });
+    if (revision !== leaderboardRevision) return refreshLeaderboardSnapshot(previous, Math.floor(nowMs() / 1000));
     store.saveLeaderboardSnapshot(rankedEntries, now, nextHourlyRefreshAt(now));
     return publicLeaderboardPayload(store.readLeaderboardSnapshot());
   }
@@ -949,7 +987,109 @@ export function createPackyApp({
   }
 
   function invalidateLeaderboard(now) {
+    leaderboardRevision += 1;
     store.invalidateLeaderboardSnapshot(now);
+  }
+
+  function rankDailyEntries(entries, previous = []) {
+    const previousRanks = new Map(previous.filter(entry => Number.isInteger(entry.rank)).map(entry => [entry.accountId, entry.rank]));
+    return entries.sort((left, right) => {
+      if (left.used === null && right.used !== null) return 1;
+      if (right.used === null && left.used !== null) return -1;
+      return (right.used || 0) - (left.used || 0) || left.name.localeCompare(right.name, 'zh-CN') || left.accountId.localeCompare(right.accountId);
+    }).map((entry, index) => {
+      const rank = entry.used === null ? null : index + 1;
+      const previousRank = previousRanks.get(entry.accountId);
+      const rankChange = rank === null || previousRank === undefined ? null : previousRank - rank;
+      return { ...entry, rank, rankChange, movement:rank === null ? 'unranked' : rankChange === null ? 'new' : rankChange > 0 ? 'up' : rankChange < 0 ? 'down' : 'same' };
+    });
+  }
+
+  function storedDayEntries(accounts, date) {
+    return accounts.map(account => {
+      const row = store.readDailyUsage(account.id, date);
+      return { accountId:String(account.id), name:account.name, used:Number.isFinite(row?.daily_used) ? row.daily_used : null,
+        stale:false, usageStatus:row?.calculation_status || 'missing' };
+    });
+  }
+
+  function publicDailyPayload(snapshot, period) {
+    const optedIn = new Set(store.listLeaderboard().map(account => String(account.id)));
+    const accounts = snapshot.accounts.filter(entry => optedIn.has(entry.accountId)).map(entry => ({
+      name:entry.name, used:entry.used, rank:entry.rank, rankChange:entry.rankChange,
+      movement:entry.movement, stale:entry.stale, usageStatus:entry.usageStatus
+    }));
+    return { period, date:snapshot.date, generatedAt:snapshot.generatedAt, nextRefreshAt:snapshot.nextRefreshAt,
+      refreshIntervalSeconds:effectiveRefreshSeconds,
+      settled:period === 'yesterday' || (snapshot.generatedAt >= dailyCaptureAt(snapshot.date) && accounts.every(entry => ['complete','reset_adjusted'].includes(entry.usageStatus) && !entry.stale)), accounts };
+  }
+
+  function getYesterdayLeaderboard() {
+    const now = Math.floor(nowMs() / 1000);
+    const date = shiftDateKey(shanghaiDateKey(now), -1);
+    const accounts = store.listLeaderboard();
+    const previous = rankDailyEntries(storedDayEntries(accounts, shiftDateKey(date, -1)));
+    return publicDailyPayload({ date, generatedAt:now, nextRefreshAt:nextHourlyRefreshAt(now), accounts:rankDailyEntries(storedDayEntries(accounts,date),previous) }, 'yesterday');
+  }
+
+  async function refreshTodayLeaderboard() {
+    // Membership changes, settlement and midnight invalidate an in-flight round.
+    // Retry from the shared usage cache, never publish a mixed-date snapshot.
+    while (true) {
+      const revision = leaderboardRevision;
+      const now = Math.floor(nowMs() / 1000);
+      const date = shanghaiDateKey(now);
+      const afterSettlement = now >= dailyCaptureAt(date);
+      const snapshot = store.readTodayLeaderboard();
+      if (snapshot?.date === date && snapshot.nextRefreshAt > now) return publicDailyPayload(snapshot, 'today');
+      const previous = snapshot?.date === date ? snapshot.accounts : [];
+      const previousById = new Map(previous.map(entry => [entry.accountId,entry]));
+      const accounts = store.listLeaderboard();
+      const entries = [];
+      for (const [index,account] of accounts.entries()) {
+        let used = null;
+        let usageStatus = 'missing_previous';
+        let stale = false;
+        let name = account.name;
+        if (afterSettlement) {
+          const row = store.readDailyUsage(account.id,date);
+          used = Number.isFinite(row?.daily_used) ? row.daily_used : null;
+          usageStatus = row?.calculation_status || 'pending';
+        } else {
+          const baseline = store.readDailyUsage(account.id,shiftDateKey(date,-1));
+          if (baseline?.capture_succeeded && Number.isFinite(baseline.cumulative_used)) {
+            if (index > 0 && effectiveLeaderboardSpacingMs > 0) await new Promise(resolveDelay => setTimeout(resolveDelay,effectiveLeaderboardSpacingMs));
+            const usage = await getAccountUsage(account);
+            name = usage.name;
+            if (usage.status === 'ok' && Number.isFinite(usage.used) && usage.fetchedAt >= baseline.captured_at) {
+              const reset = usage.quotaPeriodStart !== baseline.quota_period_start || usage.used < baseline.cumulative_used;
+              used = reset ? usage.used : round(usage.used - baseline.cumulative_used,6);
+              usageStatus = reset ? 'reset_adjusted' : 'complete';
+            } else usageStatus = 'query_failed';
+          }
+        }
+        const prior = previousById.get(String(account.id));
+        if (used === null && ['query_failed','pending','capture_failed'].includes(usageStatus) && Number.isFinite(prior?.used)) {
+          used = prior.used;
+          stale = true;
+        }
+        entries.push({ accountId:String(account.id), name, used, stale, usageStatus });
+      }
+      const finishedAt = Math.floor(nowMs() / 1000);
+      if (revision !== leaderboardRevision || shanghaiDateKey(finishedAt) !== date || (finishedAt >= dailyCaptureAt(date)) !== afterSettlement) continue;
+      // A visitor arriving exactly at 23:00 may beat the capture. Re-read the
+      // database after five minutes so the settled result is visible before midnight.
+      const awaitingSettlement = afterSettlement && entries.some(entry => entry.usageStatus === 'pending');
+      const nextRefreshAt = awaitingSettlement ? Math.min(nextHourlyRefreshAt(now), now + effectiveRefreshSeconds) : nextHourlyRefreshAt(now);
+      const result = { date, generatedAt:now, nextRefreshAt, accounts:rankDailyEntries(entries,previous) };
+      store.saveTodayLeaderboard(result);
+      return publicDailyPayload(result,'today');
+    }
+  }
+
+  function getTodayLeaderboard() {
+    if (!todayLeaderboardInFlight) todayLeaderboardInFlight = refreshTodayLeaderboard().finally(() => { todayLeaderboardInFlight = null; });
+    return todayLeaderboardInFlight;
   }
 
   async function refreshDailyUsage({ usageDate, scheduledAt, delayed }) {
@@ -973,6 +1113,7 @@ export function createPackyApp({
         store.failDailyUsage(account.id, usageDate, capturedAt);
       }
     }
+    invalidateLeaderboard(Math.floor(nowMs() / 1000));
     return { usageDate, scheduledAt, attempted };
   }
 
@@ -1139,7 +1280,10 @@ export function createPackyApp({
       }
 
       if (request.method === 'GET' && path === '/api/leaderboard') {
-        sendJson(response, 200, await getLeaderboardPayload());
+        const period = url.searchParams.get('period') ?? 'all';
+        if (!['today','yesterday','all'].includes(period)) throw new PublicError(400, '请选择今日、昨日或累计排行榜。');
+        const payload = period === 'today' ? await getTodayLeaderboard() : period === 'yesterday' ? getYesterdayLeaderboard() : await getLeaderboardPayload();
+        sendJson(response, 200, period === 'all' && url.searchParams.has('period') ? { ...payload, period:'all', date:null, settled:false } : payload);
         return;
       }
       if (request.method === 'GET' && path === '/health') {

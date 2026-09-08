@@ -105,6 +105,161 @@ async function createFixture({ provider, startTime = 1_800_000_000_000 } = {}) {
   };
 }
 
+function seedDay(store, id, date, used, period = 1700000000) {
+  const at = Date.parse(`${date}T23:00:00+08:00`) / 1000;
+  store.claimDailyUsage(id, date, at, false);
+  if (used === null) store.failDailyUsage(id, date, at);
+  else store.completeDailyUsage(id, date, { cumulativeUsed: used, quotaPeriodStart: period, capturedAt: at });
+}
+
+async function enrollRacers(fixture, keys = [KEY_A, KEY_B, KEY_C]) {
+  const ids = [];
+  for (const key of keys) {
+    const registration = await fixture.request('203.0.113.120', '/api/accounts/register', { method:'POST', body:{ key } });
+    const id = registration.body.account.id;
+    await fixture.request('203.0.113.120', `/api/me/accounts/${id}/leaderboard`, { method:'PATCH', body:{ enabled:true } });
+    ids.push(id);
+  }
+  return ids;
+}
+
+test('daily boards rank deltas independently, preserve zero and missing, and only publish opt-ins', async (t) => {
+  let calls = 0;
+  const fixture = await createFixture({ startTime:Date.parse('2026-09-08T12:00:00+08:00'), provider:async key => {
+    calls++;
+    return packyData(key === KEY_A ? 'Alpha' : key === KEY_B ? 'Bravo' : 'Charlie', key === KEY_A ? 120 : key === KEY_B ? 210 : 50);
+  } });
+  t.after(() => fixture.close());
+  const [a,b,c] = await enrollRacers(fixture);
+  for (const [id, values] of [[a,[90,100,120]], [b,[190,205,210]]]) {
+    ['2026-09-05','2026-09-06','2026-09-07'].forEach((day,i) => seedDay(fixture.app.store,id,day,values[i]));
+  }
+  seedDay(fixture.app.store,c,'2026-09-07',null);
+  const today = (await fixture.request('203.0.113.121','/api/leaderboard?period=today')).body;
+  assert.equal(today.period,'today');
+  assert.equal(today.date,'2026-09-08');
+  assert.deepEqual(today.accounts.map(x => [x.name,x.used,x.rank]), [['Alpha',0,1],['Bravo',0,2],['Charlie',null,null]]);
+  const yesterday = (await fixture.request('203.0.113.121','/api/leaderboard?period=yesterday')).body;
+  assert.equal(yesterday.date,'2026-09-07');
+  assert.deepEqual(yesterday.accounts.map(x => [x.name,x.used,x.rankChange]), [['Alpha',20,1],['Bravo',5,-1],['Charlie',null,null]]);
+  const all = (await fixture.request('203.0.113.121','/api/leaderboard?period=all')).body;
+  assert.equal(all.accounts[0].used,210);
+  assert.equal(calls,3,'switching periods reuses registration cache; yesterday is database-only');
+  assert.deepEqual(Object.keys(today.accounts[0]).sort(), ['movement','name','rank','rankChange','stale','usageStatus','used']);
+  assert.equal((await fixture.request('203.0.113.121','/api/leaderboard?period=invalid')).status,400);
+  await fixture.request('203.0.113.120',`/api/me/accounts/${a}/leaderboard`,{ method:'PATCH',body:{ enabled:false } });
+  for (const period of ['today','yesterday','all']) {
+    const result = await fixture.request('203.0.113.121',`/api/leaderboard?period=${period}`);
+    assert.ok(result.body.accounts.every(x => x.name !== 'Alpha'));
+  }
+});
+
+test('today survives restart, compares its own rounds and never carries stale usage across dates', async (t) => {
+  let phase = 0;
+  const fixture = await createFixture({ startTime:Date.parse('2026-09-08T12:00:00+08:00'), provider:async key => {
+    if (phase === 2 && key === KEY_A) throw new Error('unavailable');
+    return packyData(key === KEY_A ? 'Alpha' : 'Bravo', key === KEY_A ? 110 : phase === 0 ? 105 : 130);
+  } });
+  t.after(() => fixture.close());
+  const ids = await enrollRacers(fixture,[KEY_A,KEY_B]);
+  for (const id of ids) seedDay(fixture.app.store,id,'2026-09-07',100);
+  const read = async () => (await fixture.request('203.0.113.121','/api/leaderboard?period=today')).body;
+  assert.equal((await read()).accounts[0].name,'Alpha');
+  await fixture.restart();
+  assert.equal((await read()).accounts[0].name,'Alpha');
+  phase = 1; fixture.advance(3600000);
+  assert.deepEqual((await read()).accounts.map(x => [x.name,x.rankChange]), [['Bravo',1],['Alpha',-1]]);
+  phase = 2; fixture.advance(3600000);
+  const fallback = (await read()).accounts.find(x => x.name === 'Alpha');
+  assert.equal(fallback.used,10); assert.equal(fallback.stale,true);
+  fixture.setTime(Date.parse('2026-09-09T00:00:00+08:00'));
+  assert.ok((await read()).accounts.every(x => x.used === null && x.rank === null));
+});
+
+test('today freezes at settlement, includes quota reset status and invalidates on capture completion', async (t) => {
+  let used = 12;
+  const fixture = await createFixture({ startTime:Date.parse('2026-09-08T22:00:00+08:00'), provider:async () => packyData('Alpha',used,100,1800000000) });
+  t.after(() => fixture.close());
+  const [id] = await enrollRacers(fixture,[KEY_A]);
+  seedDay(fixture.app.store,id,'2026-09-07',100);
+  const read = async () => (await fixture.request('203.0.113.121','/api/leaderboard?period=today')).body;
+  const before = await read();
+  assert.equal(before.accounts[0].used,12); assert.equal(before.accounts[0].usageStatus,'reset_adjusted');
+  used = 90; fixture.setTime(Date.parse('2026-09-08T23:00:00+08:00'));
+  const pending = await read();
+  assert.equal(pending.accounts[0].used,12); assert.equal(pending.accounts[0].stale,true);
+  assert.equal(pending.nextRefreshAt,Date.parse('2026-09-08T23:05:00+08:00') / 1000);
+  await fixture.app.runDailyCapture();
+  const settled = await read();
+  assert.equal(settled.settled,true); assert.equal(settled.accounts[0].used,90);
+  used = 1000; fixture.advance(600000);
+  assert.equal((await read()).accounts[0].used,90);
+});
+
+test('an opt-out during a pending daily refresh is filtered and does not cache obsolete membership', async (t) => {
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  let block = false;
+  const fixture = await createFixture({ startTime:Date.parse('2026-09-08T12:00:00+08:00'),provider:async key => {
+    if (block && key === KEY_A) { entered(); await gate; }
+    return packyData(key === KEY_A ? 'Alpha' : 'Bravo',120);
+  } });
+  t.after(() => fixture.close());
+  const [a,b] = await enrollRacers(fixture,[KEY_A,KEY_B]);
+  for (const id of [a,b]) seedDay(fixture.app.store,id,'2026-09-07',100);
+  fixture.advance(3600000); block = true;
+  const pending = fixture.request('203.0.113.121','/api/leaderboard?period=today');
+  await started;
+  await fixture.request('203.0.113.120',`/api/me/accounts/${a}/leaderboard`,{ method:'PATCH',body:{ enabled:false } });
+  release();
+  const response = await pending;
+  assert.deepEqual(response.body.accounts.map(x => [x.name,x.rank]),[['Bravo',1]]);
+  assert.deepEqual(fixture.app.store.readTodayLeaderboard().accounts.map(x => x.accountId),[b]);
+});
+
+test('a refresh crossing midnight restarts with the new date and never mixes daily baselines', async (t) => {
+  let release;
+  let entered;
+  const gate = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  let block = false;
+  const fixture = await createFixture({ startTime:Date.parse('2026-09-08T22:00:00+08:00'),provider:async () => {
+    if (block) { entered(); await gate; }
+    return packyData('Alpha',120);
+  } });
+  t.after(() => fixture.close());
+  const [id] = await enrollRacers(fixture,[KEY_A]);
+  seedDay(fixture.app.store,id,'2026-09-07',100);
+  fixture.advance(600000); block=true;
+  const pending = fixture.request('203.0.113.121','/api/leaderboard?period=today');
+  await started;
+  fixture.setTime(Date.parse('2026-09-09T00:00:00+08:00'));
+  release();
+  const response = await pending;
+  assert.equal(response.body.date,'2026-09-09');
+  assert.equal(response.body.accounts[0].used,null);
+});
+
+test('concurrent today requests share one round and an unavailable entrant does not prevent other ranks', async (t) => {
+  let calls = 0;
+  let fail = false;
+  const fixture = await createFixture({ startTime:Date.parse('2026-09-08T12:00:00+08:00'),provider:async key => {
+    calls++;
+    await new Promise(resolve => setTimeout(resolve,5));
+    if (fail && key === KEY_A) throw new Error('unavailable');
+    return packyData(key === KEY_A ? 'Alpha' : 'Bravo',120);
+  } });
+  t.after(() => fixture.close());
+  const ids = await enrollRacers(fixture,[KEY_A,KEY_B]);
+  for (const id of ids) seedDay(fixture.app.store,id,'2026-09-07',100);
+  fixture.advance(3600000); calls=0; fail=true;
+  const responses = await Promise.all([1,2,3].map(()=>fixture.request('203.0.113.121','/api/leaderboard?period=today')));
+  assert.equal(calls,2);
+  for (const response of responses) assert.deepEqual(response.body.accounts.map(x => [x.name,x.used,x.rank]),[['Bravo',20,1],['Alpha',null,null]]);
+});
+
 test('normalizes IPs and trusts forwarding headers only from configured proxies', () => {
   assert.equal(normalizeIp('::ffff:127.0.0.1'), '127.0.0.1');
   assert.equal(normalizeIp('FE80::1%12'), 'fe80::1');
@@ -142,7 +297,7 @@ test('aligns daily usage captures to 23:00 in Asia/Shanghai', () => {
   assert.equal(nextDailyCaptureAt(atBoundary), nextBoundary);
 });
 
-test('migrates a version 1 database to version 4 without losing accounts', () => {
+test('migrates a version 1 database to version 5 without losing accounts', () => {
   const directory = mkdtempSync(join(tmpdir(), 'packy-usage-migration-'));
   const databasePath = join(directory, 'usage.sqlite');
   const legacy = new DatabaseSync(databasePath);
@@ -173,7 +328,7 @@ test('migrates a version 1 database to version 4 without losing accounts', () =>
   legacy.close();
 
   const store = new AccountStore(databasePath, Buffer.alloc(32, 9));
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 4);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 5);
   assert.equal(store.counts().accounts, 1);
   assert.equal(store.listByIp('203.0.113.8')[0].name, 'Legacy');
   assert.ok(store.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leaderboard_snapshots'").get());

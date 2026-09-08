@@ -4,10 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>packycode用量查询 · 用量排行榜</title>
+  <title>packycode用量查询 · 赛事排行榜</title>
   <link rel="stylesheet" href="/packy-usage.css">
 </head>
-<body>
+<body class="race-page">
   <header class="app-header">
     <a class="brand" href="/my"><span class="brand-mark" aria-hidden="true">P</span><span class="brand-name">packycode用量查询</span></a>
     <nav class="main-nav" aria-label="主导航">
@@ -15,95 +15,194 @@
       <a class="nav-link is-active" href="/leaderboard" aria-current="page"><i data-lucide="trophy" aria-hidden="true"></i>排行榜</a>
     </nav>
     <div class="header-actions">
-      <button class="button header-refresh" id="refreshButton" type="button" disabled><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button>
-      <button class="icon-button" id="themeButton" type="button" aria-label="切换主题"><i data-lucide="moon" aria-hidden="true"></i></button>
+      <button class="button header-refresh" id="refreshButton" type="button" aria-label="刷新排行榜"><i data-lucide="refresh-cw" aria-hidden="true"></i><span>刷新</span></button>
+      <button class="icon-button" id="themeButton" type="button" aria-label="切换主题"><i data-lucide="sun" aria-hidden="true"></i></button>
     </div>
   </header>
-  <main class="page">
-    <div class="page-heading">
-      <div><h1>账号消耗排行</h1><div class="subtitle" id="updatedLabel" aria-live="polite">正在读取排行数据</div></div>
-      <div class="countdown">下次更新 <strong id="countdown">--:--</strong></div>
-    </div>
-    <div class="error-banner" id="errorBanner" role="alert"><i data-lucide="circle-alert" aria-hidden="true"></i><span id="errorText"></span></div>
-    <section class="leaderboard-shell" aria-labelledby="leaderboardTitle">
-      <div class="leaderboard-header">
-        <div><span class="leaderboard-kicker">RACE CONTROL · LIVE STANDINGS</span><h2 class="leaderboard-title" id="leaderboardTitle"><i data-lucide="trophy" aria-hidden="true"></i>赛事排行榜</h2></div>
-        <span class="cache-label">整点刷新 · 较上轮排名</span>
+  <main class="page race-main">
+    <section class="race-intro" aria-labelledby="pageTitle">
+      <div class="race-intro-copy">
+        <div class="race-eyebrow"><span></span> PACKYCODE / PADDOCK</div>
+        <h1 id="pageTitle">每一份用量，<br><em>全力上榜。</em></h1>
+        <p>今日角逐，昨日战绩。让每一次创造，都有迹可循。</p>
       </div>
-      <div class="loading-state" id="loadingState"><div class="state-stack"><i data-lucide="loader-circle" aria-hidden="true"></i><span>正在同步用量</span></div></div>
-      <div class="empty-state" id="emptyState" hidden><div class="state-stack"><i data-lucide="list-ordered" aria-hidden="true"></i><span>暂时没有账号参与排行</span></div></div>
-      <div class="leaderboard-content" id="leaderboardContent" hidden>
-        <div class="podium-wrap" id="podiumWrap">
-          <div class="podium-grid" id="podiumGrid" aria-label="排行榜前三名"></div>
-        </div>
-        <div class="table-wrap standings-wrap" id="tableWrap" hidden>
-          <div class="standings-heading"><span>完整赛况</span><span>第 4 名起</span></div>
-          <table class="usage-table"><thead><tr><th class="rank-column">排名</th><th>账号</th><th class="movement-column">变化</th><th class="amount-column">已用金额</th></tr></thead><tbody id="leaderboardBody"></tbody></table>
-        </div>
+      <div class="circuit-art" aria-hidden="true">
+        <svg viewBox="0 0 410 210" fill="none">
+          <defs><linearGradient id="circuitGlow" x1="0" y1="0" x2="410" y2="210" gradientUnits="userSpaceOnUse"><stop stop-color="#a1ffcb"/><stop offset="1" stop-color="#26c7b3"/></linearGradient></defs>
+          <path class="circuit-shadow" d="M78 162C27 164 14 105 58 84L179 29C211 14 228 39 213 65L192 101C183 118 199 136 219 124L286 83C317 64 359 77 362 111C365 144 334 177 299 174L251 170C229 168 228 150 204 153L78 162Z"/>
+          <path class="circuit-line" d="M78 162C27 164 14 105 58 84L179 29C211 14 228 39 213 65L192 101C183 118 199 136 219 124L286 83C317 64 359 77 362 111C365 144 334 177 299 174L251 170C229 168 228 150 204 153L78 162Z"/>
+          <path d="M111 144L113 175M118 143L120 174" stroke="#edfff6" stroke-width="3" stroke-dasharray="4 4"/>
+          <circle cx="115" cy="159" r="6" fill="#a1ffcb"/>
+        </svg>
+        <span class="circuit-caption">THE PACKY CIRCUIT <b>01 / 夜间赛道</b></span>
       </div>
     </section>
+    <section class="leaderboard-shell" aria-label="用量排行榜">
+      <div class="race-toolbar">
+        <div class="race-tabs" role="tablist" aria-label="排行榜时段">
+          <button id="tab-today" role="tab" aria-selected="true" aria-controls="racePanel" tabindex="0" data-period="today">今日<span>TODAY</span></button>
+          <button id="tab-yesterday" role="tab" aria-selected="false" aria-controls="racePanel" tabindex="-1" data-period="yesterday">昨日<span>YESTERDAY</span></button>
+          <button id="tab-all" role="tab" aria-selected="false" aria-controls="racePanel" tabindex="-1" data-period="all">累计<span>OVERALL</span></button>
+        </div>
+        <div class="race-status"><span class="status-dot"></span><span id="periodStatus">今日进行中</span><span class="race-date" id="raceDate">—</span></div>
+      </div>
+      <div id="racePanel" role="tabpanel" aria-labelledby="tab-today" aria-busy="true">
+        <div class="race-summary">
+          <div class="race-summary-title"><span class="leaderboard-kicker">THE STANDINGS</span><h2 id="leaderboardTitle">今日排行榜</h2></div>
+          <div class="race-stat"><span id="totalLabel">今日合计</span><strong id="totalUsage">—</strong></div>
+          <div class="race-stat"><span>已排名 / 参榜账号</span><strong id="rankedCount">—</strong></div>
+          <div class="race-stat race-next"><span>整点刷新 · 下次更新</span><strong id="countdown">--:--</strong></div>
+        </div>
+        <div class="error-banner" id="errorBanner" role="alert"><i data-lucide="circle-alert" aria-hidden="true"></i><span id="errorText"></span><button id="retryButton" class="button" type="button">重试</button></div>
+        <div class="loading-state" id="loadingState"><div class="state-stack"><i data-lucide="loader-circle" aria-hidden="true"></i><span>正在读取赛况</span></div></div>
+        <div class="empty-state" id="emptyState" hidden><div class="state-stack"><i data-lucide="flag" aria-hidden="true"></i><span>赛道已就绪，等待首位参榜账号</span><a href="/my">前往我的用量，加入排行 →</a></div></div>
+        <div class="leaderboard-content" id="leaderboardContent" hidden>
+          <div class="podium-wrap" id="podiumWrap"><div class="podium-grid" id="podiumGrid" aria-label="排行榜前三名"></div><div class="podium-track" aria-hidden="true"><span>START / FINISH</span></div></div>
+          <div class="race-missing" id="missingNotice" hidden>暂无完整日用量，等待每日记录。缺失数据不计入排名。</div>
+          <div class="table-wrap standings-wrap" id="tableWrap" hidden>
+            <div class="standings-heading"><span>赛道席位 <small>REST OF THE GRID</small></span><span id="movementLabel">较上轮排名</span></div>
+            <table class="usage-table"><thead><tr><th class="rank-column" scope="col">排名</th><th scope="col">参榜账号</th><th class="movement-column" scope="col">变化</th><th class="amount-column" id="amountLabel" scope="col">今日用量</th></tr></thead><tbody id="leaderboardBody"></tbody></table>
+          </div>
+        </div>
+        <footer class="race-footer"><span id="updatedLabel" aria-live="polite">正在读取排行数据</span><span>仅展示主动参榜账号 · USD</span></footer>
+      </div>
+    </section>
+    <div class="race-bottom"><span>CREATE MORE. GO FURTHER.</span><a href="/my">管理我的参榜账号 <span aria-hidden="true">↗</span></a></div>
   </main>
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
   <script>
     (() => {
-      const state = { accounts:[], refreshSeconds:300, nextRefreshAt:Date.now() + 300000, loading:false };
+      const state = { period:"today", payload:null, accounts:[], nextRefreshAt:Date.now() + 300000, loading:false, sequence:0, controller:null };
       const $ = (id) => document.getElementById(id);
-      const elements = { refreshButton:$("refreshButton"), themeButton:$("themeButton"), updatedLabel:$("updatedLabel"), countdown:$("countdown"), errorBanner:$("errorBanner"), errorText:$("errorText"), loadingState:$("loadingState"), emptyState:$("emptyState"), leaderboardContent:$("leaderboardContent"), podiumWrap:$("podiumWrap"), podiumGrid:$("podiumGrid"), tableWrap:$("tableWrap"), leaderboardBody:$("leaderboardBody") };
+      const tabs = [...document.querySelectorAll("[data-period]")];
+      const labels = { today:"今日", yesterday:"昨日", all:"累计" };
       const money = new Intl.NumberFormat("en-US", { style:"currency", currency:"USD", minimumFractionDigits:2, maximumFractionDigits:2 });
       function icons() { if (window.lucide) window.lucide.createIcons({ attrs:{ "stroke-width":1.8 } }); }
       function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" })[char]); }
-      function formatDuration(seconds) { const safe = Math.max(0, Math.ceil(seconds)); return `${String(Math.floor(safe / 60)).padStart(2,"0")}:${String(safe % 60).padStart(2,"0")}`; }
-      function showError(message) { elements.errorText.textContent = message; elements.errorBanner.classList.add("is-visible"); }
-      function clearError() { elements.errorText.textContent = ""; elements.errorBanner.classList.remove("is-visible"); }
+      function formatDuration(seconds) { const safe = Math.max(0, Math.ceil(seconds)); return String(Math.floor(safe / 60)).padStart(2,"0") + ":" + String(safe % 60).padStart(2,"0"); }
       function initial(name) { const chars = Array.from(String(name || "P").trim()); return chars[chars.length - 1]?.toUpperCase() || "P"; }
-      function staleBadge(account) { return account.stale ? `<span class="stale-badge">沿用上轮</span>` : ""; }
+      function staleBadge(account) {
+        if (account.stale) return '<span class="stale-badge">沿用上轮</span>';
+        if (account.usageStatus === "reset_adjusted") return '<span class="stale-badge">周期调整</span>';
+        return "";
+      }
       function movementBadge(account) {
-        const change = Number(account.rankChange);
-        if (account.movement === "up") return `<span class="movement movement-up" aria-label="上升 ${Math.abs(change)} 名">↑ ${Math.abs(change)}</span>`;
-        if (account.movement === "down") return `<span class="movement movement-down" aria-label="下降 ${Math.abs(change)} 名">↓ ${Math.abs(change)}</span>`;
-        if (account.movement === "new") return `<span class="movement movement-new" aria-label="首次上榜">NEW</span>`;
-        return `<span class="movement movement-same" aria-label="与上轮持平">—</span>`;
+        const change = Math.abs(Number(account.rankChange));
+        if (account.movement === "up") return '<span class="movement movement-up" aria-label="上升 ' + change + ' 名">↑ ' + change + '</span>';
+        if (account.movement === "down") return '<span class="movement movement-down" aria-label="下降 ' + change + ' 名">↓ ' + change + '</span>';
+        if (account.movement === "new") return '<span class="movement movement-new" aria-label="暂无可比名次">NEW</span>';
+        return '<span class="movement movement-same" aria-label="' + (account.rank === null ? "暂无名次" : "名次持平") + '">—</span>';
       }
       function renderPodium(account) {
-        const rank = Number(account.rank);
-        const place = rank === 1 ? "冠军" : (rank === 2 ? "亚军" : "季军");
-        return `<article class="podium-card podium-rank-${rank}" data-rank="${rank}"><div class="podium-position"><span class="podium-number">0${rank}</span><span>${place}</span></div><div class="podium-avatar" aria-hidden="true">${escapeHtml(initial(account.name))}</div><div class="podium-name"><span class="podium-name-text">${escapeHtml(account.name)}</span>${staleBadge(account)}</div><div class="podium-meta"><span class="podium-amount">${account.used === null ? "暂不可用" : money.format(Number(account.used))}</span>${movementBadge(account)}</div></article>`;
+        const rank = account.rank;
+        const place = rank === 1 ? "领跑者" : rank === 2 ? "第二名" : "第三名";
+        return '<article class="podium-card podium-rank-' + rank + '" data-rank="' + rank + '">' +
+          '<div class="podium-honor">' + (rank === 1 ? '<i data-lucide="crown" aria-hidden="true"></i>' : '<span class="honor-line"></span>') + '<span>' + place + '</span></div>' +
+          '<div class="podium-avatar" aria-hidden="true">' + escapeHtml(initial(account.name)) + '</div>' +
+          '<div class="podium-name"><span class="podium-name-text" title="' + escapeHtml(account.name) + '">' + escapeHtml(account.name) + '</span></div>' +
+          '<div class="podium-meta"><span class="podium-amount">' + money.format(account.used) + '</span><div class="podium-badges">' + movementBadge(account) + staleBadge(account) + '</div></div>' +
+          '<div class="podium-plinth" aria-hidden="true"><span>0' + rank + '</span><small>' + (rank === 1 ? 'POLE POSITION' : rank === 2 ? 'SILVER' : 'BRONZE') + '</small></div></article>';
       }
       function render() {
-        elements.loadingState.hidden = true;
-        const hasAccounts = state.accounts.length > 0;
-        elements.emptyState.hidden = hasAccounts; elements.leaderboardContent.hidden = !hasAccounts;
-        const podiumAccounts = state.accounts.slice(0,3);
-        const remainingAccounts = state.accounts.slice(3);
-        elements.podiumWrap.hidden = podiumAccounts.length === 0;
-        elements.podiumGrid.dataset.count = String(podiumAccounts.length);
-        elements.podiumGrid.innerHTML = podiumAccounts.map(renderPodium).join("");
-        elements.tableWrap.hidden = remainingAccounts.length === 0;
-        elements.leaderboardBody.innerHTML = remainingAccounts.map((account,index) => { const rank = Number(account.rank || index + 4); return `<tr data-rank="${rank}"><td class="rank-column"><span class="rank-number">${String(rank).padStart(2,"0")}</span></td><td><div class="leader-name"><span class="leader-name-text">${escapeHtml(account.name)}</span>${staleBadge(account)}</div></td><td class="movement-column">${movementBadge(account)}</td><td class="amount-column"><span class="amount">${account.used === null ? "暂不可用" : money.format(Number(account.used))}</span></td></tr>`; }).join("");
+        const payload = state.payload;
+        const valid = state.accounts.filter(account => Number.isFinite(account.used) && Number.isInteger(account.rank));
+        const podium = valid.filter(account => account.rank <= 3);
+        const remaining = state.accounts.filter(account => !podium.includes(account));
+        $("loadingState").hidden = true;
+        $("emptyState").hidden = state.accounts.length > 0;
+        $("leaderboardContent").hidden = state.accounts.length === 0;
+        $("podiumWrap").hidden = podium.length === 0;
+        $("podiumGrid").dataset.count = String(podium.length);
+        $("podiumGrid").innerHTML = podium.map(renderPodium).join("");
+        $("missingNotice").hidden = !(state.accounts.length && !valid.length);
+        $("tableWrap").hidden = remaining.length === 0;
+        $("leaderboardBody").innerHTML = remaining.map(account => {
+          const rank = account.used === null ? null : account.rank;
+          return '<tr><td class="rank-column"><span class="rank-number">' + (rank === null ? '—' : String(rank).padStart(2,"0")) + '</span></td>' +
+            '<td><div class="leader-name"><span class="grid-avatar" aria-hidden="true">' + escapeHtml(initial(account.name)) + '</span><div class="grid-account"><span class="leader-name-text" title="' + escapeHtml(account.name) + '">' + escapeHtml(account.name) + '</span>' + staleBadge(account) + '</div></div></td>' +
+            '<td class="movement-column">' + movementBadge({ ...account, rank }) + '</td><td class="amount-column"><span class="amount">' + (account.used === null ? '<span class="no-data">暂无数据</span>' : money.format(account.used)) + '</span></td></tr>';
+        }).join("");
+        $("totalUsage").textContent = valid.length ? money.format(valid.reduce((sum,account) => sum + account.used,0)) : "—";
+        $("rankedCount").textContent = valid.length + " / " + state.accounts.length;
+        $("raceDate").textContent = payload.date ? payload.date.replaceAll("-"," / ") : "当前额度周期";
+        const dayClosed = payload.date && Date.now() >= Date.parse(payload.date + "T23:00:00+08:00");
+        $("periodStatus").textContent = state.period === "all" ? "累计赛况" : state.period === "yesterday" ? "昨日战绩" : payload.settled ? "今日已结算" : dayClosed ? "今日已截止" : "今日进行中";
+        const staleCount = state.accounts.filter(account => account.stale).length;
+        const missingCount = state.accounts.length - valid.length;
+        $("updatedLabel").textContent = "更新于 " + new Date(payload.generatedAt * 1000).toLocaleString("zh-CN",{ timeZone:"Asia/Shanghai",hour12:false }) +
+          (staleCount ? " · " + staleCount + " 个账号沿用上轮" : "") + (missingCount ? " · " + missingCount + " 个账号暂无数据" : "");
+        $("leaderboardContent").getAnimations().forEach(animation => animation.cancel());
+        if (!matchMedia("(prefers-reduced-motion: reduce)").matches) $("leaderboardContent").animate([{ opacity:0, transform:"translateY(6px)" },{ opacity:1, transform:"translateY(0)" }],{ duration:240,easing:"ease-out" });
+        icons();
+      }
+      function selectPeriod(period) {
+        if (period === state.period && state.payload) return;
+        state.period = period; state.payload = null; state.accounts = [];
+        tabs.forEach(tab => { const selected = tab.dataset.period === period; tab.setAttribute("aria-selected",String(selected)); tab.tabIndex = selected ? 0 : -1; });
+        $("racePanel").setAttribute("aria-labelledby","tab-" + period);
+        $("leaderboardTitle").textContent = labels[period] + "排行榜";
+        $("totalLabel").textContent = labels[period] + "合计";
+        $("amountLabel").textContent = labels[period] + "用量";
+        $("movementLabel").textContent = period === "yesterday" ? "较前一日排名" : "较上轮排名";
+        $("raceDate").textContent = "—"; $("periodStatus").textContent = labels[period] + "赛况";
+        $("totalUsage").textContent = "—"; $("rankedCount").textContent = "—";
+        $("updatedLabel").textContent = "正在读取排行数据";
+        $("leaderboardContent").hidden = true; $("emptyState").hidden = true; $("loadingState").hidden = false;
+        loadLeaderboard();
       }
       async function loadLeaderboard() {
-        if (state.loading) return;
-        state.loading = true; elements.refreshButton.disabled = true; clearError();
+        const sequence = ++state.sequence;
+        state.controller?.abort();
+        const controller = new AbortController(); state.controller = controller;
+        const timeout = setTimeout(() => controller.abort(),90000);
+        state.loading = true; $("refreshButton").disabled = true;
+        $("racePanel").setAttribute("aria-busy","true");
+        $("errorBanner").classList.remove("is-visible");
         try {
-          const response = await fetch("/api/leaderboard", { cache:"no-store" }); const payload = await response.json();
-          if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
-          state.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
-          state.refreshSeconds = Math.max(300, Number(payload.refreshIntervalSeconds || 300));
-          state.nextRefreshAt = Number(payload.nextRefreshAt || 0) * 1000 || Date.now() + state.refreshSeconds * 1000;
-          const updatedAt = new Date(Number(payload.generatedAt) * 1000).toLocaleString("zh-CN", { hour12:false });
-          const staleCount = state.accounts.filter((account) => account.stale).length;
-          elements.updatedLabel.textContent = staleCount ? `数据更新于 ${updatedAt} · ${staleCount} 个账号沿用上轮` : `数据更新于 ${updatedAt} · 较上轮排名`;
+          const response = await fetch("/api/leaderboard?period=" + state.period,{ cache:"no-store", signal:controller.signal });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.message || "无法读取排行榜");
+          if (sequence !== state.sequence) return;
+          state.payload = payload; state.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+          state.nextRefreshAt = Number(payload.nextRefreshAt) * 1000 || Date.now() + 300000;
           render();
-        } catch (error) { showError(error.message || "无法读取排行榜"); elements.updatedLabel.textContent = state.accounts.length ? elements.updatedLabel.textContent : "读取失败"; state.nextRefreshAt = Date.now() + state.refreshSeconds * 1000; }
-        finally { state.loading = false; updateCountdown(); }
+        } catch (error) {
+          if (sequence !== state.sequence) return;
+          $("loadingState").hidden = true;
+          $("errorText").textContent = state.payload ? "本轮刷新失败，继续显示上一轮排行。" : "暂时无法读取" + labels[state.period] + "排行榜，请重试。";
+          $("errorBanner").classList.add("is-visible");
+          if (!state.payload) $("updatedLabel").textContent = "读取失败";
+          state.nextRefreshAt = Date.now() + 300000;
+        } finally {
+          clearTimeout(timeout);
+          if (sequence === state.sequence) { state.loading = false; $("refreshButton").disabled = false; $("racePanel").setAttribute("aria-busy","false"); updateCountdown(); }
+        }
       }
-      function updateCountdown() { const remaining = (state.nextRefreshAt - Date.now()) / 1000; elements.countdown.textContent = formatDuration(remaining); const ready = remaining <= 0 && !state.loading; elements.refreshButton.disabled = !ready; if (ready) loadLeaderboard(); }
-      function applyTheme(theme) { document.documentElement.dataset.theme = theme; elements.themeButton.innerHTML = `<i data-lucide="${theme === "dark" ? "sun" : "moon"}" aria-hidden="true"></i>`; icons(); }
-      function initTheme() { const saved = localStorage.getItem("packy-theme"); applyTheme(saved || (window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light")); }
+      function updateCountdown() {
+        const remaining = (state.nextRefreshAt - Date.now()) / 1000;
+        $("countdown").textContent = formatDuration(remaining);
+        if (remaining <= 0 && !state.loading && !document.hidden) loadLeaderboard();
+      }
+      function applyTheme(theme) { document.documentElement.dataset.theme = theme; $("themeButton").innerHTML = '<i data-lucide="' + (theme === "dark" ? "sun" : "moon") + '" aria-hidden="true"></i>'; icons(); }
+      tabs.forEach((tab,index) => {
+        tab.addEventListener("click",() => selectPeriod(tab.dataset.period));
+        tab.addEventListener("keydown",event => {
+          let next;
+          if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+          else if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+          else if (event.key === "Home") next = 0;
+          else if (event.key === "End") next = tabs.length - 1;
+          else return;
+          event.preventDefault(); tabs[next].focus(); selectPeriod(tabs[next].dataset.period);
+        });
+      });
       window.addEventListener("storage", (event) => { if (event.key === "packy-leaderboard-refresh") loadLeaderboard(); });
-      elements.refreshButton.addEventListener("click", loadLeaderboard);
-      elements.themeButton.addEventListener("click", () => { const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; localStorage.setItem("packy-theme", next); applyTheme(next); });
-      initTheme(); icons(); loadLeaderboard(); window.setInterval(updateCountdown,1000);
+      document.addEventListener("visibilitychange",() => { if (!document.hidden) loadLeaderboard(); });
+      $("refreshButton").addEventListener("click",loadLeaderboard);
+      $("retryButton").addEventListener("click",loadLeaderboard);
+      $("themeButton").addEventListener("click",() => { const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; try { localStorage.setItem("packy-theme",theme); } catch {} applyTheme(theme); });
+      let savedTheme; try { savedTheme = localStorage.getItem("packy-theme"); } catch {}
+      applyTheme(savedTheme || "dark"); icons(); loadLeaderboard(); setInterval(updateCountdown,1000);
     })();
   </script>
 </body>
